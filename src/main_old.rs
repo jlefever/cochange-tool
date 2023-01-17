@@ -96,54 +96,54 @@ fn lookup_parents(repo: Repository, req: CommitRequest) -> Result<CommitRequest>
 //     }
 // }
 
-fn main() -> anyhow::Result<()> {
-    let cli = <Cli as clap::Parser>::parse();
-    env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
-
-    let mut buffer = String::new();
-    io::stdin().read_to_string(&mut buffer)?;
-    let reqs = parse_commit_reqs(&buffer)?;
-
-    let cwd = current_dir().context("failed to access the current working directory")?;
-    let repo = Repository::discover(cwd)
-        .context("failed to find git repository in the current directory")?;
-
-    if reqs.iter().all(|r| !r.has_parents()) {}
-
-    println!("{reqs:#?}");
-
-    Ok(())
-}
-
-// fn main2() -> anyhow::Result<()> {
+// fn main() -> anyhow::Result<()> {
 //     let cli = <Cli as clap::Parser>::parse();
 //     env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
 
-//     extern "C" {
-//         fn tree_sitter_java() -> Language;
-//     }
+//     let mut buffer = String::new();
+//     io::stdin().read_to_string(&mut buffer)?;
+//     let reqs = parse_commit_reqs(&buffer)?;
 
-//     let language = unsafe { tree_sitter_java() };
+//     let cwd = current_dir().context("failed to access the current working directory")?;
+//     let repo = Repository::discover(cwd)
+//         .context("failed to find git repository in the current directory")?;
 
-//     let start = Instant::now();
-//     let source_code = read_to_string(cli.filename).context("failed to read source file")?;
-//     let read_elapsed = start.elapsed();
+//     if reqs.iter().all(|r| !r.has_parents()) {}
 
-//     let java_query = include_str!("../queries/java/tags.scm");
-
-//     let start = Instant::now();
-//     let mut generator = TagGenerator::new(language, java_query)?;
-//     let generation_elapsed = start.elapsed();
-
-//     log::info!(
-//         "Read file in {} ms. Generated tags in {} ms.",
-//         read_elapsed.as_millis(),
-//         generation_elapsed.as_millis()
-//     );
-
-//     for tag in generator.generate_tags(source_code)? {
-//         println!("{tag:#?}");
-//     }
+//     println!("{reqs:#?}");
 
 //     Ok(())
 // }
+
+fn main2() -> anyhow::Result<()> {
+    let cli = <Cli as clap::Parser>::parse();
+    env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
+
+    extern "C" {
+        fn tree_sitter_java() -> Language;
+    }
+
+    let language = unsafe { tree_sitter_java() };
+
+    let start = Instant::now();
+    let source_code = read_to_string(cli.filename).context("failed to read source file")?;
+    let read_elapsed = start.elapsed();
+
+    let java_query = include_str!("../queries/java/tags.scm");
+
+    let start = Instant::now();
+    let mut generator = TagGenerator::new(language, java_query)?;
+    let generation_elapsed = start.elapsed();
+
+    log::info!(
+        "Read file in {} ms. Generated tags in {} ms.",
+        read_elapsed.as_millis(),
+        generation_elapsed.as_millis()
+    );
+
+    for tag in generator.generate_tags(source_code)? {
+        println!("{tag:#?}");
+    }
+
+    Ok(())
+}

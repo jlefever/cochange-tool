@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -10,35 +11,35 @@ struct PreTag {
     id: usize,
     ancestor_ids: Vec<usize>,
     name: String,
-    kind: Rc<String>,
+    kind: Arc<String>,
     range: Range,
 }
 
 #[derive(Debug)]
 pub struct Tag {
     pub name: String,
-    pub parent: Option<Rc<Tag>>,
-    pub kind: Rc<String>,
+    pub parent: Option<Arc<Tag>>,
+    pub kind: Arc<String>,
 }
 
 impl Tag {
-    pub fn new(parent: Rc<Tag>, name: String, kind: Rc<String>) -> Self {
+    pub fn new(parent: Arc<Tag>, name: String, kind: Arc<String>) -> Self {
         Self { name, parent: Some(parent), kind }
     }
 
-    pub fn new_root(name: String, kind: Rc<String>) -> Self {
+    pub fn new_root(name: String, kind: Arc<String>) -> Self {
         Self { name, parent: None, kind }
     }
 }
 
 #[derive(Debug)]
 pub struct LocalTag {
-    pub tag: Rc<Tag>,
+    pub tag: Arc<Tag>,
     pub range: Range,
 }
 
 impl LocalTag {
-    pub fn new(tag: Rc<Tag>, range: Range) -> Self {
+    pub fn new(tag: Arc<Tag>, range: Range) -> Self {
         Self { tag, range }
     }
 }
@@ -58,7 +59,7 @@ fn get_ancestor_ids(node: &Node) -> Vec<usize> {
 fn to_local_tags(mut pre_tags: Vec<PreTag>) -> Vec<LocalTag> {
     pre_tags.sort_by_key(|t| t.ancestor_ids.len());
 
-    let mut tags: HashMap<usize, Rc<Tag>> = HashMap::new();
+    let mut tags: HashMap<usize, Arc<Tag>> = HashMap::new();
     let mut local_tags = Vec::new();
 
     for pre_tag in pre_tags {
@@ -72,7 +73,7 @@ fn to_local_tags(mut pre_tags: Vec<PreTag>) -> Vec<LocalTag> {
             None => Tag::new_root(pre_tag.name, pre_tag.kind),
         };
 
-        let tag = Rc::new(tag);
+        let tag = Arc::new(tag);
         local_tags.push(LocalTag::new(tag.clone(), pre_tag.range));
         tags.insert(pre_tag.id, tag);
     }
@@ -84,7 +85,7 @@ pub struct TagGenerator {
     parser: Parser,
     query: Query,
     name_ix: u32,
-    tag_kinds: Vec<Option<Rc<String>>>,
+    tag_kinds: Vec<Option<Arc<String>>>,
 }
 
 impl TagGenerator {
@@ -95,21 +96,22 @@ impl TagGenerator {
 
         let name_ix =
             query.capture_index_for_name("name").context("failed to find `name` capture")?;
-        let tag_kinds: Vec<Option<Rc<String>>> = query
+
+        let tag_kinds = query
             .capture_names()
             .iter()
-            .map(|n| n.strip_prefix("tag.").map(|n| Rc::new(n.to_string())))
-            .collect();
+            .map(|n| n.strip_prefix("tag.").map(|n| Arc::new(n.to_string())))
+            .collect::<Vec<_>>();
 
         Ok(Self { parser, query, name_ix, tag_kinds })
     }
 
-    pub fn generate_tags<S: AsRef<str>>(&mut self, source_code: S) -> Result<Vec<LocalTag>> {
+    pub fn generate_tags(&mut self, source_code: impl AsRef<[u8]>) -> Result<Vec<LocalTag>> {
         self.parser.reset();
         let tree =
             self.parser.parse(source_code.as_ref(), None).context("failed to parse source code")?;
         let mut cursor = QueryCursor::new();
-        let source_bytes = source_code.as_ref().as_bytes();
+        let source_bytes = source_code.as_ref();
 
         let mut pre_tags = Vec::new();
 

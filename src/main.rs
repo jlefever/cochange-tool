@@ -4,18 +4,21 @@
 extern crate derive_builder;
 
 mod tagging;
+mod walking;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use bitflags::bitflags;
 use clap::{App, CommandFactory};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
-use git2::{Commit, Oid, Reference, Repository};
+use git2::{Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort};
 use time::format_description::well_known::Iso8601;
-use time::{Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
+use time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
+
+use crate::walking::{CommitWalk, RefGlobKind};
 
 /// Iterates through the commit history of a git repository and stores the
 /// (co-)change information of each semantic entity encountered. A "semantic
@@ -132,107 +135,6 @@ struct Cli {
     // paths: Vec<String>,
 }
 
-bitflags! {
-    struct CommitInfo: u8 {
-        const CHANGES = 0b00000001;
-        const PRESENCE = 0b00000010;
-        const REACHABILITY = 0b00000100;
-        const ALL = Self::CHANGES.bits | Self::PRESENCE.bits | Self::REACHABILITY.bits;
-    }
-}
-
-fn time_of(commit: &Commit) -> anyhow::Result<OffsetDateTime> {
-    let commit_time = commit.time();
-    let datetime = OffsetDateTime::from_unix_timestamp(commit_time.seconds())?;
-    let offset = UtcOffset::from_whole_seconds(commit_time.offset_minutes() * 60)?;
-    Ok(datetime.replace_offset(offset))
-}
-
-#[derive(Debug, Hash, PartialEq, Eq)]
-enum RefGlobKind {
-    All,
-    Branches,
-    Tags,
-    Remotes,
-}
-
-struct CommitWalker {
-    max_count: Option<usize>,
-    since: Option<OffsetDateTime>,
-    until: Option<OffsetDateTime>,
-    globs: Vec<String>,
-    start_oids: HashSet<Oid>,
-}
-
-impl CommitWalker {
-    fn new() -> Self {
-        Self {
-            max_count: None,
-            since: None,
-            until: None,
-            globs: Vec::new(),
-            start_oids: HashSet::new(),
-        }
-    }
-
-    fn set_max_count(&mut self, max_count: usize) {
-        self.max_count = Some(max_count);
-    }
-
-    fn set_since(&mut self, since: OffsetDateTime) {
-        self.since = Some(since);
-    }
-
-    fn set_until(&mut self, until: OffsetDateTime) {
-        self.until = Some(until);
-    }
-
-    fn push_glob(&mut self, kind: RefGlobKind, glob: Option<String>) {
-        let glob = glob.unwrap_or("*".to_string());
-
-        self.globs.push(match kind {
-            RefGlobKind::All => glob,
-            RefGlobKind::Branches => format!("heads/{}", glob),
-            RefGlobKind::Tags => format!("tags/{}", glob),
-            RefGlobKind::Remotes => format!("remotes/{}", glob),
-        });
-    }
-
-    fn push_start_oid(&mut self, oid: Oid) {
-        self.start_oids.insert(oid);
-    }
-
-    fn walk<'r>(&self, repo: &'r Repository) -> anyhow::Result<Vec<Commit<'r>>> {
-        let mut revwalk = repo.revwalk()?;
-        revwalk.set_sorting(git2::Sort::TIME)?;
-        self.globs.iter().try_for_each(|g| revwalk.push_glob(g))?;
-        self.start_oids.iter().try_for_each(|&oid| revwalk.push(oid))?;
-
-        let mut commits = Vec::new();
-
-        for oid in revwalk {
-            let commit = repo.find_commit(oid?)?;
-            let commit_time = time_of(&commit)?;
-
-            let is_valid_by_since = self.since.map(|t| commit_time >= t).unwrap_or(true);
-            let is_valid_by_until = self.until.map(|t| commit_time <= t).unwrap_or(true);
-            let is_valid_by_n = self.max_count.map(|n| commits.len() < n).unwrap_or(true);
-
-            if !is_valid_by_since || !is_valid_by_n {
-                break;
-            }
-
-            if !is_valid_by_until {
-                continue;
-            }
-
-            commits.push(commit);
-        }
-
-        Ok(commits)
-    }
-}
-
 fn parse_time_input<S: AsRef<str>>(text: S) -> Option<OffsetDateTime> {
     // First, try to parse it as a date and time
     if let Ok(datetime) = OffsetDateTime::parse(text.as_ref(), &Iso8601::PARSING) {
@@ -275,38 +177,176 @@ fn validate_ref_input<'r>(app: &mut App, repo: &'r Repository, input: String) ->
     }
 }
 
+bitflags! {
+    struct CommitInfo: u8 {
+        const CHANGES = 0b00000001;
+        const PRESENCE = 0b00000010;
+        const REACHABILITY = 0b00000100;
+        const ALL = Self::CHANGES.bits | Self::PRESENCE.bits | Self::REACHABILITY.bits;
+    }
+}
+
+struct Hunk {
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+}
+
+impl From<DiffHunk<'_>> for Hunk {
+    fn from(diff_hunk: DiffHunk) -> Self {
+        Self {
+            old_start: diff_hunk.old_start(),
+            old_lines: diff_hunk.old_lines(),
+            new_start: diff_hunk.new_start(),
+            new_lines: diff_hunk.new_lines(),
+        }
+    }
+}
+
+fn get_diff_delta_path(diff_delta: &DiffDelta) -> anyhow::Result<String> {
+    let old_path = diff_delta.old_file().path();
+    let new_path = diff_delta.new_file().path();
+
+    Ok(match (old_path, new_path) {
+        (None, None) => bail!("at least one side of diff must be non-empty"),
+        (None, Some(path)) => path,
+        (Some(path), None) => path,
+        (Some(old_path), Some(new_path)) => {
+            if old_path != new_path {
+                bail!("renames and moves are not supported");
+            } else {
+                old_path
+            }
+        }
+    }
+    .to_string_lossy()
+    .to_string())
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ChangedFile {
+    filename: String,
+    old_file: Oid,
+    new_file: Oid,
+    commit: Oid,
+}
+
+impl ChangedFile {
+    fn new(filename: String, old_file: Oid, new_file: Oid, commit: Oid) -> Self {
+        Self { filename, old_file, new_file, commit }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = <Cli as clap::Parser>::parse();
     env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
 
     let mut cmd = Cli::command();
+
+    // Create CommitWalk from cli input
+    let mut walk = CommitWalk::new();
     let since = cli.since.map(|s| validate_time_input(&mut cmd, s, "--since"));
     let until = cli.until.map(|s| validate_time_input(&mut cmd, s, "--until"));
-
-    let mut walker = CommitWalker::new();
-    since.map(|s| walker.set_since(s));
-    until.map(|u| walker.set_until(u));
-    cli.max_count.map(|n| walker.set_max_count(n));
+    since.map(|s| walk.set_since(s));
+    until.map(|u| walk.set_until(u));
+    cli.max_count.map(|n| walk.set_max_count(n));
 
     if cli.all {
-        walker.push_glob(RefGlobKind::All, None);
+        walk.push_glob(RefGlobKind::All, None);
     }
 
-    cli.branches.map(|g| walker.push_glob(RefGlobKind::Branches, g));
-    cli.tags.map(|g| walker.push_glob(RefGlobKind::Tags, g));
-    cli.remotes.map(|g| walker.push_glob(RefGlobKind::Remotes, g));
+    cli.branches.map(|g| walk.push_glob(RefGlobKind::Branches, g));
+    cli.tags.map(|g| walk.push_glob(RefGlobKind::Tags, g));
+    cli.remotes.map(|g| walk.push_glob(RefGlobKind::Remotes, g));
 
     let repo = Repository::discover(cli.repo.unwrap_or(PathBuf::from(".")))
-        .context("failed to find git repository in the provided directory")?;
+        .context("failed to find git repository at or above the provided directory")?;
 
     for r#ref in cli.refs {
         let r#ref = validate_ref_input(&mut cmd, &repo, r#ref);
-        walker.push_start_oid(r#ref.peel_to_commit()?.id());
+        walk.push_start_oid(r#ref.peel_to_commit()?.id());
     }
 
-    let start = Instant::now();
-    let commits = walker.walk(&repo)?;
-    log::info!("Found {} commits in {} ms.", commits.len(), start.elapsed().as_millis());
+    // This is a necessary config for Windows. Even though we never touch the actual
+    // filesystem, because libgit2 emulates the behavior of the real git, it will
+    // still crash on Windows when encountering especially long paths.
+    repo.config()?.set_bool("core.longpaths", true)?;
 
+    // Initial collection of commits into HashMap
+    // We walk in reverse chronological order. This is to ensure the "-n" flag works
+    // as expected. For instance, "-n 50" should fetch the 50 most recent commits.
+    let start = Instant::now();
+    walk.set_sort(Sort::TIME);
+    let commits = walk.clone().walk(&repo)?;
+    let commits = commits.map(|res| res.map(|c| (c.id(), c))).try_collect::<HashMap<_, _>>()?;
+    log::info!("Found {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
+
+    // Re-order commits topologically.
+    // Not sure if this is necessary anymore.
+    let start = Instant::now();
+    walk.set_sort(Sort::TOPOLOGICAL | Sort::REVERSE);
+    let revwalk = walk.revwalk(&repo)?;
+    let commits = revwalk.filter_map(|res| commits.get(&res.unwrap())).collect::<Vec<_>>();
+    log::info!("Re-ordered {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
+
+    // Diff Experiment
+    let mut opts = DiffOptions::new();
+    opts.ignore_filemode(true);
+    opts.ignore_whitespace(false);
+    opts.ignore_whitespace_change(false);
+    opts.ignore_whitespace_eol(false);
+    opts.ignore_blank_lines(false);
+    opts.indent_heuristic(false);
+    opts.context_lines(0);
+
+    let start = Instant::now();
+    let mut hunks: HashMap<ChangedFile, Vec<Hunk>> = HashMap::new();
+
+    for commit in commits {
+        let parents = commit.parents().collect::<Vec<_>>();
+        let new_tree = commit.tree()?;
+
+        let diff = match parents.len() {
+            0 => repo.diff_tree_to_tree(None, Some(&new_tree), Some(&mut opts)),
+            1 => {
+                let parent = parents.get(0).unwrap();
+                let old_tree = parent.tree()?;
+                repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
+            }
+            _ => continue,
+        }?;
+
+        diff.foreach(
+            &mut |_, _| true,
+            None,
+            Some(&mut |delta, hunk| {
+                let is_supported_status = match delta.status() {
+                    Delta::Added => true,
+                    Delta::Deleted => true,
+                    Delta::Modified => true,
+                    _ => false,
+                };
+
+                if !is_supported_status {
+                    log::warn!("Skipping unsupported diff status: {:?}", &delta.status());
+                    return true;
+                }
+
+                let filename = get_diff_delta_path(&delta).unwrap();
+                let old_file = delta.old_file().id();
+                let new_file = delta.new_file().id();
+
+                let changed_file = ChangedFile::new(filename, old_file, new_file, commit.id());
+
+                hunks.entry(changed_file).or_default().push(Hunk::from(hunk));
+                return true;
+            }),
+            None,
+        )
+        .context("failed to iterate over diff")?;
+    }
+
+    log::info!("Found {} changed files in {}ms", hunks.len(), start.elapsed().as_millis());
     Ok(())
 }

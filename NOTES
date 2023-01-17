@@ -1,0 +1,40 @@
+DiffHunk:
+old_start: u32
+old_lines: u32
+new_start: u32
+new_lines: u32
+
+InputEdit:
+start_byte: usize
+old_end_byte: usize
+new_end_byte: usize
+
+start_position: Point
+old_end_position: Point
+new_end_position: Point
+
+-------------
+
+An array `arr: Vec<usize>`.
+- The first  element of `arr` is the index into `contents: &[u8]` where the first  line starts
+- The second element of `arr` is the index into `contents: &[u8]` where the second line starts
+
+-------------
+
+Rules for first hunk:
+- If old_lines > 0 and new_lines > 0, then new_start = old_start
+- If old_lines = 0                  , then new_start = old_start + 1
+- If new_lines = 0                  , then new_start = old_start - 1
+- The remaining case (old_lines = 0 and new_lines = 0) never occurs
+
+General rules:
+- old_start = 0 only happens when file is being created
+- new_start = 0 only happens when file is being deleted
+
+
+Two things to do:
+- Turn DiffHunk into InputEdit
+- Keep track of offsets (only matters for many DiffHunks)
+
+For now, focus on diffs with a single hunk.
+- Deletions and insertions are the easier cases
