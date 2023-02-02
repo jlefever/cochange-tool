@@ -1,12 +1,12 @@
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::{borrow::Borrow, collections::HashMap, sync::Arc};
 
-use bitflags::bitflags;
-use git2::{Commit, Oid};
-use rusqlite::{params, params_from_iter, CachedStatement, Params, ToSql, Transaction};
+use git2::Commit;
+use rusqlite::{params, CachedStatement, Transaction};
 
-use crate::{tagging::Tag, time::to_datetime};
+use crate::time::to_datetime;
+
+use crate::ir::*;
 
 pub type Id = usize;
 
@@ -124,14 +124,6 @@ impl CommitKey {
     }
 }
 
-bitflags! {
-    pub struct CommitInfo: u8 {
-        const CHANGES = 0b00000001;
-        const PRESENCE = 0b00000010;
-        const REACHABILITY = 0b00000100;
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CommitExtra {
     is_merge: bool,
@@ -141,7 +133,12 @@ pub struct CommitExtra {
 }
 
 impl CommitExtra {
-    pub fn new(is_merge: bool, author_time: i64, commit_time: i64, commit_info: CommitInfo) -> Self {
+    pub fn new(
+        is_merge: bool,
+        author_time: i64,
+        commit_time: i64,
+        commit_info: CommitInfo,
+    ) -> Self {
         Self { is_merge, author_time, commit_time, commit_info }
     }
 }
@@ -194,35 +191,6 @@ pub fn insert_commit(vt: &mut CommitVirtualTable, commit: &Commit) -> Id {
 // ========================================================
 // Change -------------------------------------------------
 // ========================================================
-
-// TODO: Move this elsewhere
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ChangeKind {
-    Added,
-    #[default]
-    Modified,
-    Deleted,
-}
-
-impl ChangeKind {
-    fn to_char(&self) -> char {
-        self.into()
-    }
-
-    fn to_string(&self) -> String {
-        self.to_char().to_string()
-    }
-}
-
-impl From<&ChangeKind> for char {
-    fn from(change_kind: &ChangeKind) -> Self {
-        match change_kind {
-            ChangeKind::Added => 'A',
-            ChangeKind::Modified => 'M',
-            ChangeKind::Deleted => 'D',
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChangeKey {
@@ -278,124 +246,3 @@ impl<'a> SqlWriter<'a, ChangeKey, ChangeExtra> for ChangeWriter<'a> {
         ])?)
     }
 }
-
-// #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-// struct EntityRow {
-//     parent_id: Option<Pk>,
-//     name: String,
-//     kind: Arc<String>,
-// }
-
-// impl EntityRow {
-//     fn new(parent_id: Option<Pk>, name: String, kind: Arc<String>) -> Self {
-//         Self { parent_id, name, kind }
-//     }
-// }
-
-// pub struct EntityVt {
-//     map: HashMap<EntityRow, Pk>,
-//     next_pk: Pk,
-// }
-
-// impl EntityVt {
-//     pub fn new() -> Self {
-//         Self { map: HashMap::new(), next_pk: 0 }
-//     }
-
-//     pub fn insert_entity<E: Borrow<Tag>>(&mut self, entity: E) -> Pk {
-//         let mut prev_id = None;
-
-//         for (name, kind) in entity.borrow().to_vec() {
-//             let row = EntityRow::new(prev_id, name, kind);
-//             prev_id = Some(self.insert_row(row));
-//         }
-
-//         prev_id.unwrap()
-//     }
-
-//     fn insert_row(&mut self, row: EntityRow) -> Pk {
-//         *self.map.entry(row).or_insert_with(|| {
-//             let pk = self.next_pk;
-//             self.next_pk += 1;
-//             pk
-//         })
-//     }
-
-//     pub fn len(&self) -> usize {
-//         self.map.len()
-//     }
-
-//     pub fn write(self, tx: &Transaction) -> anyhow::Result<()> {
-//         let mut arr = self.map.into_iter().collect::<Vec<_>>();
-//         arr.sort_by_key(|&(_, pk)| pk);
-
-//         let mut stmt = tx.prepare_cached(
-//             "INSERT INTO entities (id, parent_id, name, kind) VALUES (?, ?,
-// ?, ?);",         )?;
-
-//         for (row, pk) in arr {
-//             let x = params![pk, row.parent_id, row.name, row.kind];
-
-//             stmt.execute(params![pk, row.parent_id, row.name, row.kind])?;
-//         }
-
-//         Ok(())
-//     }
-// }
-
-// #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-// struct CommitRow {
-//     sha1: Oid,
-//     is_merge: bool,
-
-//     author_name: Option<String>,
-//     author_mail: Option<String>,
-//     author_time: i64,
-
-//     commit_name: Option<String>,
-//     commit_mail: Option<String>,
-//     commit_time: i64,
-
-//     has_change_info: bool,
-//     has_presence_info: bool,
-//     has_reachability_info: bool,
-// }
-
-// impl CommitRow {
-//     fn new<'r, C: Borrow<Commit<'r>>>(commit: C, info: CommitInfo) -> Self {
-//         let commit: &Commit = commit.borrow();
-
-//         Self {
-//             sha1: commit.id(),
-//             is_merge: commit.parent_count() > 1,
-//             author_name: commit.author().name().map(str::to_string),
-//             author_mail: commit.author().email().map(str::to_string),
-//             author_time:
-// to_datetime(&commit.author().when()).unwrap().unix_timestamp(),
-// commit_name: commit.committer().name().map(str::to_string),
-// commit_mail: commit.committer().email().map(str::to_string),
-// commit_time:
-// to_datetime(&commit.committer().when()).unwrap().unix_timestamp(),
-//             has_change_info: info.contains(CommitInfo::CHANGES),
-//             has_presence_info: info.contains(CommitInfo::PRESENCE),
-//             has_reachability_info: info.contains(CommitInfo::REACHABILITY),
-//         }
-//     }
-// }
-
-// pub struct CommitVt {
-//     map: HashMap<Oid, (CommitRow, Pk)>,
-//     next_pk: Pk,
-// }
-
-// impl CommitVt {
-//     pub fn new() -> Self {
-//         Self { map: HashMap::new(), next_pk: 0 }
-//     }
-
-//     pub fn insert_commit<'r, C: Borrow<Commit<'r>>>(&mut self, commit: C) ->
-// Pk {         todo!()
-//     }
-
-//     fn insert_row(&mut self, row: CommitRow) -> Pk {}
-// }

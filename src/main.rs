@@ -3,15 +3,13 @@
 #[macro_use]
 extern crate derive_builder;
 
+mod ir;
 mod persist;
 mod tagging;
 mod time;
 mod walking;
 
-use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
-use std::num::TryFromIntError;
-use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,20 +17,21 @@ use std::time::Instant;
 use ::time::format_description::well_known::Iso8601;
 use ::time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
 use anyhow::{bail, Context};
-use bitflags::bitflags;
 use clap::{App, CommandFactory};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use git2::{
     Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort, Tree, TreeWalkMode,
     TreeWalkResult,
 };
-use persist::{ChangeKind, ChangeVirtualTable, CommitKey, ChangeKey, ChangeExtra, Id};
+use persist::{ChangeExtra, ChangeKey, ChangeVirtualTable, CommitKey, Id};
 use rusqlite::{params, Connection};
-use tagging::{LocalTag, Tag, TagGenerator};
+use tagging::TagGenerator;
 use tree_sitter::Language;
 
+use crate::ir::*;
 use crate::persist::{
-    insert_commit, insert_tag, CommitVirtualTable, CommitWriter, EntityVirtualTable, EntityWriter, ChangeWriter,
+    insert_commit, insert_tag, ChangeWriter, CommitVirtualTable, CommitWriter, EntityVirtualTable,
+    EntityWriter,
 };
 use crate::walking::{CommitWalk, RefGlobKind};
 
@@ -193,44 +192,30 @@ fn validate_ref_input<'r>(app: &mut App, repo: &'r Repository, input: &String) -
     }
 }
 
-#[derive(Debug)]
-struct Hunk {
-    old_start: usize,
-    old_lines: usize,
-    new_start: usize,
-    new_lines: usize,
-}
-
-impl Hunk {
-    fn old_interval(&self) -> Interval {
-        let old_start = self.old_start - 1; // Convert to zero-based index
-        Interval(old_start, old_start + self.old_lines)
-    }
-
-    fn new_interval(&self) -> Interval {
-        let new_start = self.new_start - 1; // Convert to zero-based index
-        Interval(new_start, new_start + self.new_lines)
-    }
-
-    // fn old_range(&self) -> Range<usize> {
-    //     self.old_start..(self.old_start + self.old_lines)
-    // }
-
-    // fn new_range(&self) -> Range<usize> {
-    //     self.new_start..(self.new_start + self.new_lines)
-    // }
-}
-
 impl TryFrom<DiffHunk<'_>> for Hunk {
-    type Error = TryFromIntError;
+    type Error = anyhow::Error;
 
     fn try_from(diff_hunk: DiffHunk<'_>) -> Result<Self, Self::Error> {
-        Ok(Self {
-            old_start: diff_hunk.old_start().try_into()?,
-            old_lines: diff_hunk.old_lines().try_into()?,
-            new_start: diff_hunk.new_start().try_into()?,
-            new_lines: diff_hunk.new_lines().try_into()?,
-        })
+        // Avoid underflows
+        if diff_hunk.old_start() == 0 || diff_hunk.new_start() == 0 {
+            log::warn!("Found zero-based index: {:?}", diff_hunk);
+            // bail!("expected one-based index");
+        }
+
+        // Convert to zero-based index
+        let old_start = diff_hunk.old_start() - 1;
+        let new_start = diff_hunk.new_start() - 1;
+
+        // Convert to usize
+        let old_start: usize = old_start.try_into()?;
+        let new_start: usize = new_start.try_into()?;
+        let old_lines: usize = diff_hunk.old_lines().try_into()?;
+        let new_lines: usize = diff_hunk.new_lines().try_into()?;
+
+        Ok(Hunk::new(
+            Interval(old_start, old_start + old_lines),
+            Interval(new_start, new_start + new_lines),
+        ))
     }
 }
 
@@ -254,23 +239,7 @@ fn get_diff_delta_path(diff_delta: &DiffDelta) -> anyhow::Result<String> {
     .to_string())
 }
 
-// both endpoints should be inclusive
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Interval(usize, usize);
-
-impl Interval {
-    fn intersect(&self, other: &Interval) -> usize {
-        let p0 = self.0.max(other.0);
-        let p1 = self.1.min(other.1);
-        p1.checked_sub(p0).unwrap_or_default()
-    }
-}
-
-fn to_interval(range: &tree_sitter::Range) -> Interval {
-    Interval(range.start_point.row, range.end_point.row)
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ChangedFile {
     filename: String,
     old_file: Oid,
@@ -282,19 +251,6 @@ impl ChangedFile {
     fn new(filename: String, old_file: Oid, new_file: Oid, commit: Oid) -> Self {
         Self { filename, old_file, new_file, commit }
     }
-}
-
-// TODO: Move this elsewhere
-#[derive(Debug, Builder)]
-pub struct Change {
-    tag: Arc<Tag>,
-    commit: Oid,
-    #[builder(default)]
-    kind: ChangeKind,
-    #[builder(default)]
-    adds: usize,
-    #[builder(default)]
-    dels: usize,
 }
 
 struct ChangeGenerator<'t, 'r> {
@@ -332,8 +288,7 @@ impl<'t, 'r> ChangeGenerator<'t, 'r> {
         let new_file = changed_file.new_file;
 
         for old_tag in self.get_tags(filename, old_file) {
-            let tag_interval = to_interval(&old_tag.range);
-            let dels = hunks.iter().map(|h| h.old_interval().intersect(&tag_interval)).sum();
+            let dels = hunks.iter().map(|h| h.old_interval.intersect(&old_tag.interval)).sum();
 
             if dels > 0 {
                 changes.entry(old_tag.tag.clone()).or_default().dels(dels);
@@ -341,8 +296,7 @@ impl<'t, 'r> ChangeGenerator<'t, 'r> {
         }
 
         for new_tag in self.get_tags(filename, new_file) {
-            let tag_interval = to_interval(&new_tag.range);
-            let adds = hunks.iter().map(|h| h.new_interval().intersect(&tag_interval)).sum();
+            let adds = hunks.iter().map(|h| h.new_interval.intersect(&new_tag.interval)).sum();
 
             if adds > 0 {
                 changes.entry(new_tag.tag.clone()).or_default().adds(adds);

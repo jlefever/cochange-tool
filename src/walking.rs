@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use git2::{Commit, Oid, Repository, Revwalk, Sort};
-use time::{OffsetDateTime, UtcOffset};
+use time::OffsetDateTime;
 
 use crate::time::to_datetime;
 
