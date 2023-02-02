@@ -2,9 +2,11 @@
 
 #[macro_use]
 extern crate derive_builder;
+extern crate derive_new;
 
+mod db;
 mod ir;
-mod persist;
+mod persistence;
 mod tagging;
 mod time;
 mod walking;
@@ -20,19 +22,16 @@ use anyhow::{bail, Context};
 use clap::{App, CommandFactory};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use git2::{
-    Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort, Tree, TreeWalkMode,
-    TreeWalkResult,
+    Commit, Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort,
+    TreeWalkMode, TreeWalkResult,
 };
-use persist::{ChangeExtra, ChangeKey, ChangeVirtualTable, CommitKey, Id};
-use rusqlite::{params, Connection};
-use tagging::TagGenerator;
+use rusqlite::Connection;
 use tree_sitter::Language;
 
+use crate::db::VirtualDb;
 use crate::ir::*;
-use crate::persist::{
-    insert_commit, insert_tag, ChangeWriter, CommitVirtualTable, CommitWriter, EntityVirtualTable,
-    EntityWriter,
-};
+use crate::persistence::{insert_change, insert_commit, insert_presence, insert_ref};
+use crate::tagging::TagGenerator;
 use crate::walking::{CommitWalk, RefGlobKind};
 
 /// Iterates through the commit history of a git repository and stores the
@@ -322,10 +321,10 @@ impl<'t, 'r> ChangeGenerator<'t, 'r> {
             .collect()
     }
 
-    fn generate_presence(&mut self, tree: &Tree) -> anyhow::Result<Vec<LocalTag>> {
+    fn generate_presence(&mut self, commit: &Commit) -> anyhow::Result<Vec<Presence>> {
         let mut blobs = Vec::new();
 
-        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+        commit.tree()?.walk(TreeWalkMode::PreOrder, |dir, entry| {
             if !matches!(entry.kind().unwrap(), git2::ObjectType::Blob) {
                 return TreeWalkResult::Ok;
             }
@@ -341,75 +340,24 @@ impl<'t, 'r> ChangeGenerator<'t, 'r> {
             TreeWalkResult::Ok
         })?;
 
-        let mut local_tags = Vec::new();
+        let mut presences = Vec::new();
 
         for (filename, blob) in &blobs {
             for local_tag in self.get_tags(&filename, blob.clone()) {
-                local_tags.push(local_tag.clone());
+                presences.push(Presence::new(local_tag.clone(), commit.id()));
             }
         }
 
-        Ok(local_tags)
+        Ok(presences)
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = <Cli as clap::Parser>::parse();
-    env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
+fn generate_hunks(
+    repo: &Repository,
+    commits: &Vec<&Commit>,
+) -> anyhow::Result<HashMap<ChangedFile, Vec<Hunk>>> {
+    let mut hunks: HashMap<ChangedFile, Vec<Hunk>> = HashMap::new();
 
-    let mut cmd = Cli::command();
-
-    // Create CommitWalk from cli input
-    let mut walk = CommitWalk::new();
-    let since = cli.since.map(|s| validate_time_input(&mut cmd, s, "--since"));
-    let until = cli.until.map(|s| validate_time_input(&mut cmd, s, "--until"));
-    since.map(|s| walk.set_since(s));
-    until.map(|u| walk.set_until(u));
-    cli.max_count.map(|n| walk.set_max_count(n));
-
-    if cli.all {
-        walk.push_glob(RefGlobKind::All, None);
-    }
-
-    cli.branches.map(|g| walk.push_glob(RefGlobKind::Branches, g));
-    cli.tags.map(|g| walk.push_glob(RefGlobKind::Tags, g));
-    cli.remotes.map(|g| walk.push_glob(RefGlobKind::Remotes, g));
-
-    let repo = Repository::discover(cli.repo.unwrap_or(PathBuf::from(".")))
-        .context("failed to find git repository at or above the provided directory")?;
-
-    // TODO: Add support for --all flag
-    let mut lead_refs = Vec::new();
-
-    for ref_name in &cli.refs {
-        lead_refs.push(validate_ref_input(&mut cmd, &repo, ref_name));
-        let r#ref = validate_ref_input(&mut cmd, &repo, ref_name);
-        walk.push_start_oid(r#ref.peel_to_commit()?.id());
-    }
-
-    // This is a necessary config for Windows. Even though we never touch the actual
-    // filesystem, because libgit2 emulates the behavior of the real git, it will
-    // still crash on Windows when encountering especially long paths.
-    repo.config()?.set_bool("core.longpaths", true)?;
-
-    // Initial collection of commits into HashMap
-    // We walk in reverse chronological order. This is to ensure the "-n" flag works
-    // as expected. For instance, "-n 50" should fetch the 50 most recent commits.
-    let start = Instant::now();
-    walk.set_sort(Sort::TIME);
-    let commits = walk.clone().walk(&repo)?;
-    let commits = commits.map(|res| res.map(|c| (c.id(), c))).try_collect::<HashMap<_, _>>()?;
-    log::info!("Found {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
-
-    // Re-order commits topologically.
-    // Not sure if this is necessary anymore.
-    let start = Instant::now();
-    walk.set_sort(Sort::TOPOLOGICAL | Sort::REVERSE);
-    let revwalk = walk.revwalk(&repo)?;
-    let commits = revwalk.filter_map(|res| commits.get(&res.unwrap())).collect::<Vec<_>>();
-    log::info!("Re-ordered {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
-
-    // Diff Experiment
     let mut opts = DiffOptions::new();
     opts.ignore_filemode(true);
     opts.ignore_whitespace(false);
@@ -419,10 +367,7 @@ fn main() -> anyhow::Result<()> {
     opts.indent_heuristic(false);
     opts.context_lines(0);
 
-    let start = Instant::now();
-    let mut hunks: HashMap<ChangedFile, Vec<Hunk>> = HashMap::new();
-
-    for commit in &commits {
+    for commit in commits {
         let parents = commit.parents().collect::<Vec<_>>();
         let new_tree = commit.tree()?;
 
@@ -476,8 +421,78 @@ fn main() -> anyhow::Result<()> {
         .context("failed to iterate over diff")?;
     }
 
+    Ok(hunks)
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = <Cli as clap::Parser>::parse();
+    env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
+
+    let mut cmd = Cli::command();
+
+    // Create CommitWalk from cli input
+    let mut walk = CommitWalk::new();
+    let since = cli.since.map(|s| validate_time_input(&mut cmd, s, "--since"));
+    let until = cli.until.map(|s| validate_time_input(&mut cmd, s, "--until"));
+    since.map(|s| walk.set_since(s));
+    until.map(|u| walk.set_until(u));
+    cli.max_count.map(|n| walk.set_max_count(n));
+
+    if cli.all {
+        walk.push_glob(RefGlobKind::All, None);
+    }
+
+    cli.branches.map(|g| walk.push_glob(RefGlobKind::Branches, g));
+    cli.tags.map(|g| walk.push_glob(RefGlobKind::Tags, g));
+    cli.remotes.map(|g| walk.push_glob(RefGlobKind::Remotes, g));
+
+    let repo = Repository::discover(cli.repo.unwrap_or(PathBuf::from(".")))
+        .context("failed to find git repository at or above the provided directory")?;
+
+    // Idea: Maybe only use --all to determine changes
+    // If presence is desired, it needs to be explicitly listed on the command line
+    let mut lead_refs = Vec::new();
+
+    if cli.all {
+        for r#ref in repo.references()? {
+            lead_refs.push(r#ref?);
+        }
+    } else {
+        for ref_name in &cli.refs {
+            lead_refs.push(validate_ref_input(&mut cmd, &repo, ref_name));
+            let r#ref = validate_ref_input(&mut cmd, &repo, ref_name);
+            walk.push_start_oid(r#ref.peel_to_commit()?.id());
+        }
+    }
+
+    // This is a necessary config for Windows. Even though we never touch the actual
+    // filesystem, because libgit2 emulates the behavior of the real git, it will
+    // still crash on Windows when encountering especially long paths.
+    repo.config()?.set_bool("core.longpaths", true)?;
+
+    // Initial collection of commits into HashMap
+    // We walk in reverse chronological order. This is to ensure the "-n" flag works
+    // as expected. For instance, "-n 50" should fetch the 50 most recent commits.
+    let start = Instant::now();
+    walk.set_sort(Sort::TIME);
+    let commits = walk.clone().walk(&repo)?;
+    let commits = commits.map(|res| res.map(|c| (c.id(), c))).try_collect::<HashMap<_, _>>()?;
+    log::info!("Found {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
+
+    // Re-order commits topologically.
+    // Not sure if this is necessary anymore.
+    let start = Instant::now();
+    walk.set_sort(Sort::TOPOLOGICAL | Sort::REVERSE);
+    let revwalk = walk.revwalk(&repo)?;
+    let commits = revwalk.filter_map(|res| commits.get(&res.unwrap())).collect::<Vec<_>>();
+    log::info!("Re-ordered {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
+
+    // Collect changed files
+    let start = Instant::now();
+    let hunks = generate_hunks(&repo, &commits)?;
     log::info!("Found {} changed files in {}ms", hunks.len(), start.elapsed().as_millis());
 
+    // Setup tree sitter
     extern "C" {
         fn tree_sitter_java() -> Language;
     }
@@ -493,97 +508,56 @@ fn main() -> anyhow::Result<()> {
 
     for (changed_file, hunks) in &hunks {
         for change in change_gen.generate_changes(changed_file, hunks) {
-            println!("{:?}", change);
+            // println!("{:?}", change);
             changes.push(change);
         }
 
-        println!()
+        // println!()
     }
 
     log::info!("Generated changes in {}ms", start.elapsed().as_millis());
 
     // Calculate presence
-    let mut local_tags = Vec::new();
+    let mut presences = Vec::new();
 
     for lead_ref in &lead_refs {
         let lead_ref_name = lead_ref.name().context("expected a named ref")?;
         log::info!("Finding tags present in {}...", lead_ref_name);
-        let tree = &lead_ref.peel_to_tree()?;
-        for local_tag in change_gen.generate_presence(tree)? {
-            local_tags.push(local_tag);
+        let commit = &lead_ref.peel_to_commit()?;
+        for presence in change_gen.generate_presence(commit)? {
+            presences.push(presence);
         }
     }
 
+    // Create and insert into virtual database
+    let mut db = VirtualDb::new();
     let start = Instant::now();
-    let mut entity_vt = EntityVirtualTable::new();
-
-    for local_tag in local_tags {
-        insert_tag(&mut entity_vt, local_tag.tag);
-    }
-
-    log::info!(
-        "Inserted {} entitities into the virtual table in {}ms",
-        entity_vt.len(),
-        start.elapsed().as_millis()
-    );
-
-    let start = Instant::now();
-    let mut commit_vt = CommitVirtualTable::new();
 
     for commit in &commits {
-        insert_commit(&mut commit_vt, commit);
+        insert_commit(&mut db, commit);
     }
 
-    log::info!(
-        "Inserted {} commits into the virtual table in {}ms",
-        commit_vt.len(),
-        start.elapsed().as_millis()
-    );
+    for r#ref in &lead_refs {
+        insert_ref(&mut db, r#ref);
+    }
 
-    let start = Instant::now();
-    let mut change_vt = ChangeVirtualTable::new();
+    for presence in &presences {
+        insert_presence(&mut db, presence);
+    }
 
     for change in &changes {
-        insert_change(&mut commit_vt, &mut entity_vt, &mut change_vt, change);
+        insert_change(&mut db, change);
     }
 
-    log::info!(
-        "Inserted {} commits into the virtual table in {}ms",
-        commit_vt.len(),
-        start.elapsed().as_millis()
-    );
+    log::info!("Populated virtual database in {}ms", start.elapsed().as_millis());
 
-    let mut db = Connection::open(cli.db)?;
-
-    let init_script = include_str!("../sql/init_entities.sql");
-    db.execute(init_script, params![])?;
-    let init_script = include_str!("../sql/init_commits.sql");
-    db.execute(init_script, params![])?;
-    let init_script = include_str!("../sql/init_changes.sql");
-    db.execute(init_script, params![])?;
-
+    // Write virtual database to real (on disk) database
     let start = Instant::now();
-    let tx = db.transaction()?;
-    entity_vt.write::<EntityWriter>(&tx)?;
-    commit_vt.write::<CommitWriter>(&tx)?;
-    change_vt.write::<ChangeWriter>(&tx)?;
+    let mut conn = Connection::open(cli.db)?;
+    let tx = conn.transaction()?;
+    db.write(&tx)?;
     tx.commit()?;
-    log::info!("Wrote virtual tables to disk in {}ms", start.elapsed().as_millis());
+    log::info!("Wrote virtual database to disk in {}ms", start.elapsed().as_millis());
 
     Ok(())
-}
-
-pub fn insert_change(
-    commit_vt: &mut CommitVirtualTable,
-    entity_vt: &mut EntityVirtualTable,
-    change_vt: &mut ChangeVirtualTable,
-    change: &Change,
-) -> Id {
-    let commit_id = commit_vt.get_id(&CommitKey::new(change.commit.to_string())).unwrap();
-    let entity_id = insert_tag(entity_vt, change.tag.clone());
-
-    let change_key = ChangeKey::new(commit_id, entity_id);
-    let change_extra = ChangeExtra::new(change.kind, change.adds, change.dels);
-
-    change_vt.insert(change_key, change_extra)
 }

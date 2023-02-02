@@ -124,6 +124,7 @@ dependencies = [
  "cc",
  "clap",
  "clap-verbosity-flag",
+ "derive-new",
  "derive_builder",
  "env_logger",
  "git2",
@@ -165,6 +166,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7618812407e9402654622dd402b0a89dff9ba93badd6540781526117b92aab7e"
 dependencies = [
  "darling_core",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "derive-new"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3418329ca0ad70234b9735dc4ceed10af4df60eff9c8e7b06cb5e520d92c3535"
+dependencies = [
+ "proc-macro2",
  "quote",
  "syn",
 ]

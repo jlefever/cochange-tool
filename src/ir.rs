@@ -1,4 +1,5 @@
 use bitflags::bitflags;
+use derive_new::new;
 use std::sync::Arc;
 
 use git2::Oid;
@@ -45,28 +46,16 @@ impl Interval {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalTag {
     pub tag: Arc<Tag>,
     pub interval: Interval,
 }
 
-impl LocalTag {
-    pub fn new(tag: Arc<Tag>, interval: Interval) -> Self {
-        Self { tag, interval }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(new, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hunk {
     pub old_interval: Interval,
     pub new_interval: Interval,
-}
-
-impl Hunk {
-    pub fn new(old_interval: Interval, new_interval: Interval) -> Self {
-        Self { old_interval, new_interval }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -109,10 +98,22 @@ pub struct Change {
     pub dels: usize,
 }
 
+#[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Presence {
+    pub local_tag: LocalTag,
+    pub commit: Oid,
+}
+
 bitflags! {
     pub struct CommitInfo: u8 {
         const CHANGES = 0b00000001;
         const PRESENCE = 0b00000010;
         const REACHABILITY = 0b00000100;
+    }
+}
+
+impl Default for CommitInfo {
+    fn default() -> Self {
+        Self::empty()
     }
 }

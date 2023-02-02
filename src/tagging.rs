@@ -115,7 +115,7 @@ impl TagGenerator {
                     continue;
                 }
 
-                log::warn!("found unused capture");
+                log::warn!("Found unused capture: {:?}", capture);
             }
 
             pre_tags.push(builder.build()?);
