@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use git2::{Commit, Oid, Repository, Revwalk, Sort};
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::time::to_datetime;
+
 #[derive(Debug, Clone)]
 pub struct CommitWalk {
     sort_mode: Sort,
@@ -104,13 +106,13 @@ impl<'r> Iterator for CommitWalkIterator<'r> {
             }
 
             let commit = commit_res.unwrap();
-            let commit_time_res = time_of(&commit);
+            let commit_datetime_res = to_datetime(&commit.time());
 
-            if let Err(err) = commit_time_res {
+            if let Err(err) = commit_datetime_res {
                 return Some(Err(err));
             }
 
-            let commit_time = commit_time_res.unwrap();
+            let commit_time = commit_datetime_res.unwrap();
 
             let is_valid_by_since = self.walk.since.map(|t| commit_time >= t).unwrap_or(true);
             let is_valid_by_until = self.walk.until.map(|t| commit_time <= t).unwrap_or(true);
@@ -129,11 +131,4 @@ impl<'r> Iterator for CommitWalkIterator<'r> {
 
         return None;
     }
-}
-
-fn time_of(commit: &Commit) -> anyhow::Result<OffsetDateTime> {
-    let commit_time = commit.time();
-    let datetime = OffsetDateTime::from_unix_timestamp(commit_time.seconds())?;
-    let offset = UtcOffset::from_whole_seconds(commit_time.offset_minutes() * 60)?;
-    Ok(datetime.replace_offset(offset))
 }

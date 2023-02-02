@@ -1,3 +1,4 @@
+use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ struct PreTag {
     range: Range,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Tag {
     pub name: String,
     pub parent: Option<Arc<Tag>>,
@@ -30,9 +31,22 @@ impl Tag {
     pub fn new_root(name: String, kind: Arc<String>) -> Self {
         Self { name, parent: None, kind }
     }
+
+    pub fn to_vec(&self) -> Vec<(String, Arc<String>)> {
+        let mut ancestors = vec![(self.name.clone(), self.kind.clone())];
+        let mut current = &self.parent;
+
+        while let Some(tag) = current {
+            ancestors.push((tag.name.clone(), tag.kind.clone()));
+            current = &tag.parent;
+        }
+
+        ancestors.reverse();
+        ancestors
+    }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalTag {
     pub tag: Arc<Tag>,
     pub range: Range,
@@ -56,7 +70,7 @@ fn get_ancestor_ids(node: &Node) -> Vec<usize> {
     ids
 }
 
-fn to_local_tags(mut pre_tags: Vec<PreTag>) -> Vec<LocalTag> {
+fn to_local_tags(file_tag: LocalTag, mut pre_tags: Vec<PreTag>) -> Vec<LocalTag> {
     pre_tags.sort_by_key(|t| t.ancestor_ids.len());
 
     let mut tags: HashMap<usize, Arc<Tag>> = HashMap::new();
@@ -70,7 +84,7 @@ fn to_local_tags(mut pre_tags: Vec<PreTag>) -> Vec<LocalTag> {
                 Some(parent_tag) => Tag::new(parent_tag.clone(), pre_tag.name, pre_tag.kind),
                 None => unreachable!(),
             },
-            None => Tag::new_root(pre_tag.name, pre_tag.kind),
+            None => Tag::new(file_tag.tag.clone(), pre_tag.name, pre_tag.kind),
         };
 
         let tag = Arc::new(tag);
@@ -78,8 +92,19 @@ fn to_local_tags(mut pre_tags: Vec<PreTag>) -> Vec<LocalTag> {
         tags.insert(pre_tag.id, tag);
     }
 
+    local_tags.push(file_tag);
     local_tags
 }
+
+// fn push_root(local_tags: &mut Vec<LocalTag>, root: LocalTag) {
+//     for tag in local_tags.iter().map(|t| t.tag.borrow_mut()) {
+//         if tag.parent.is_none() {
+//             tag.parent = Some(root.tag.clone());
+//         }
+//     }
+
+//     local_tags.push(root);
+// }
 
 pub struct TagGenerator {
     parser: Parser,
@@ -106,7 +131,7 @@ impl TagGenerator {
         Ok(Self { parser, query, name_ix, tag_kinds })
     }
 
-    pub fn generate_tags(&mut self, source_code: impl AsRef<[u8]>) -> Result<Vec<LocalTag>> {
+    pub fn generate_tags(&mut self, filename: &String, source_code: impl AsRef<[u8]>) -> Result<Vec<LocalTag>> {
         self.parser.reset();
         let tree =
             self.parser.parse(source_code.as_ref(), None).context("failed to parse source code")?;
@@ -138,6 +163,10 @@ impl TagGenerator {
             pre_tags.push(builder.build()?);
         }
 
-        Ok(to_local_tags(pre_tags))
+        // Create a "psuedo-tag" for the file to be the root tag
+        let file_tag = Tag::new_root(filename.clone(), Arc::new("file".to_string()));
+        let file_tag = LocalTag::new(Arc::new(file_tag), tree.root_node().range());
+
+        Ok(to_local_tags(file_tag, pre_tags))
     }
 }

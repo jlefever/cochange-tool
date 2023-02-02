@@ -3,21 +3,37 @@
 #[macro_use]
 extern crate derive_builder;
 
+mod persist;
 mod tagging;
+mod time;
 mod walking;
 
-use std::collections::HashMap;
+use std::cmp::{max, min};
+use std::collections::{HashMap, HashSet};
+use std::num::TryFromIntError;
+use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
+use ::time::format_description::well_known::Iso8601;
+use ::time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
 use anyhow::{bail, Context};
 use bitflags::bitflags;
 use clap::{App, CommandFactory};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
-use git2::{Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort};
-use time::format_description::well_known::Iso8601;
-use time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
+use git2::{
+    Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort, Tree, TreeWalkMode,
+    TreeWalkResult,
+};
+use persist::{ChangeKind, ChangeVirtualTable, CommitKey, ChangeKey, ChangeExtra, Id};
+use rusqlite::{params, Connection};
+use tagging::{LocalTag, Tag, TagGenerator};
+use tree_sitter::Language;
 
+use crate::persist::{
+    insert_commit, insert_tag, CommitVirtualTable, CommitWriter, EntityVirtualTable, EntityWriter, ChangeWriter,
+};
 use crate::walking::{CommitWalk, RefGlobKind};
 
 /// Iterates through the commit history of a git repository and stores the
@@ -167,8 +183,8 @@ fn validate_time_input(app: &mut App, input: String, argument: &'static str) -> 
     }
 }
 
-fn validate_ref_input<'r>(app: &mut App, repo: &'r Repository, input: String) -> Reference<'r> {
-    match repo.resolve_reference_from_short_name(&input) {
+fn validate_ref_input<'r>(app: &mut App, repo: &'r Repository, input: &String) -> Reference<'r> {
+    match repo.resolve_reference_from_short_name(input) {
         Ok(reference) => reference,
         Err(_) => {
             let msg = format!("The given ref ('{}') was not found in this repository", input);
@@ -177,30 +193,44 @@ fn validate_ref_input<'r>(app: &mut App, repo: &'r Repository, input: String) ->
     }
 }
 
-bitflags! {
-    struct CommitInfo: u8 {
-        const CHANGES = 0b00000001;
-        const PRESENCE = 0b00000010;
-        const REACHABILITY = 0b00000100;
-        const ALL = Self::CHANGES.bits | Self::PRESENCE.bits | Self::REACHABILITY.bits;
-    }
-}
-
+#[derive(Debug)]
 struct Hunk {
-    old_start: u32,
-    old_lines: u32,
-    new_start: u32,
-    new_lines: u32,
+    old_start: usize,
+    old_lines: usize,
+    new_start: usize,
+    new_lines: usize,
 }
 
-impl From<DiffHunk<'_>> for Hunk {
-    fn from(diff_hunk: DiffHunk) -> Self {
-        Self {
-            old_start: diff_hunk.old_start(),
-            old_lines: diff_hunk.old_lines(),
-            new_start: diff_hunk.new_start(),
-            new_lines: diff_hunk.new_lines(),
-        }
+impl Hunk {
+    fn old_interval(&self) -> Interval {
+        let old_start = self.old_start - 1; // Convert to zero-based index
+        Interval(old_start, old_start + self.old_lines)
+    }
+
+    fn new_interval(&self) -> Interval {
+        let new_start = self.new_start - 1; // Convert to zero-based index
+        Interval(new_start, new_start + self.new_lines)
+    }
+
+    // fn old_range(&self) -> Range<usize> {
+    //     self.old_start..(self.old_start + self.old_lines)
+    // }
+
+    // fn new_range(&self) -> Range<usize> {
+    //     self.new_start..(self.new_start + self.new_lines)
+    // }
+}
+
+impl TryFrom<DiffHunk<'_>> for Hunk {
+    type Error = TryFromIntError;
+
+    fn try_from(diff_hunk: DiffHunk<'_>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            old_start: diff_hunk.old_start().try_into()?,
+            old_lines: diff_hunk.old_lines().try_into()?,
+            new_start: diff_hunk.new_start().try_into()?,
+            new_lines: diff_hunk.new_lines().try_into()?,
+        })
     }
 }
 
@@ -224,6 +254,22 @@ fn get_diff_delta_path(diff_delta: &DiffDelta) -> anyhow::Result<String> {
     .to_string())
 }
 
+// both endpoints should be inclusive
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Interval(usize, usize);
+
+impl Interval {
+    fn intersect(&self, other: &Interval) -> usize {
+        let p0 = self.0.max(other.0);
+        let p1 = self.1.min(other.1);
+        p1.checked_sub(p0).unwrap_or_default()
+    }
+}
+
+fn to_interval(range: &tree_sitter::Range) -> Interval {
+    Interval(range.start_point.row, range.end_point.row)
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ChangedFile {
     filename: String,
@@ -235,6 +281,121 @@ struct ChangedFile {
 impl ChangedFile {
     fn new(filename: String, old_file: Oid, new_file: Oid, commit: Oid) -> Self {
         Self { filename, old_file, new_file, commit }
+    }
+}
+
+// TODO: Move this elsewhere
+#[derive(Debug, Builder)]
+pub struct Change {
+    tag: Arc<Tag>,
+    commit: Oid,
+    #[builder(default)]
+    kind: ChangeKind,
+    #[builder(default)]
+    adds: usize,
+    #[builder(default)]
+    dels: usize,
+}
+
+struct ChangeGenerator<'t, 'r> {
+    cache: HashMap<(String, Oid), Vec<LocalTag>>,
+    tag_gen: &'t mut TagGenerator,
+    repo: &'r Repository,
+}
+
+impl<'t, 'r> ChangeGenerator<'t, 'r> {
+    fn new(tag_gen: &'t mut TagGenerator, repo: &'r Repository) -> Self {
+        Self { cache: HashMap::new(), tag_gen, repo }
+    }
+
+    fn get_tags(&mut self, filename: &String, blob: Oid) -> &Vec<LocalTag> {
+        self.cache.entry((filename.clone(), blob)).or_insert_with(|| {
+            if blob.is_zero() {
+                return Vec::new();
+            }
+
+            self.tag_gen
+                .generate_tags(filename, self.repo.find_blob(blob).unwrap().content())
+                .unwrap()
+        })
+    }
+
+    fn generate_changes(&mut self, changed_file: &ChangedFile, hunks: &Vec<Hunk>) -> Vec<Change> {
+        // Tree-sitter uses zero-based indices for rows and colums
+        // What about git-diff? I think its one-based.
+        // TODO: Confirm that git-diff is one-based.
+        // TODO: Check the inclusivity/exclusivity of the endpoints
+        let mut changes: HashMap<Arc<Tag>, ChangeBuilder> = HashMap::new();
+
+        let filename = &changed_file.filename;
+        let old_file = changed_file.old_file;
+        let new_file = changed_file.new_file;
+
+        for old_tag in self.get_tags(filename, old_file) {
+            let tag_interval = to_interval(&old_tag.range);
+            let dels = hunks.iter().map(|h| h.old_interval().intersect(&tag_interval)).sum();
+
+            if dels > 0 {
+                changes.entry(old_tag.tag.clone()).or_default().dels(dels);
+            }
+        }
+
+        for new_tag in self.get_tags(filename, new_file) {
+            let tag_interval = to_interval(&new_tag.range);
+            let adds = hunks.iter().map(|h| h.new_interval().intersect(&tag_interval)).sum();
+
+            if adds > 0 {
+                changes.entry(new_tag.tag.clone()).or_default().adds(adds);
+            }
+        }
+
+        let old_tags =
+            self.get_tags(filename, old_file).iter().map(|t| t.tag.clone()).collect::<HashSet<_>>();
+        let new_tags =
+            self.get_tags(filename, new_file).iter().map(|t| t.tag.clone()).collect::<HashSet<_>>();
+
+        for deleted in old_tags.difference(&new_tags) {
+            changes.entry(deleted.clone()).or_default().kind(ChangeKind::Deleted);
+        }
+
+        for created in new_tags.difference(&old_tags) {
+            changes.entry(created.clone()).or_default().kind(ChangeKind::Added);
+        }
+
+        changes
+            .into_iter()
+            .map(|(tag, mut change)| change.tag(tag).commit(changed_file.commit).build().unwrap())
+            .collect()
+    }
+
+    fn generate_presence(&mut self, tree: &Tree) -> anyhow::Result<Vec<LocalTag>> {
+        let mut blobs = Vec::new();
+
+        tree.walk(TreeWalkMode::PreOrder, |dir, entry| {
+            if !matches!(entry.kind().unwrap(), git2::ObjectType::Blob) {
+                return TreeWalkResult::Ok;
+            }
+
+            let filename = format!("{}{}", dir, entry.name().unwrap());
+
+            if !filename.ends_with(".java") {
+                return TreeWalkResult::Ok;
+            }
+
+            let blob = entry.to_object(self.repo).unwrap().id();
+            blobs.push((filename, blob));
+            TreeWalkResult::Ok
+        })?;
+
+        let mut local_tags = Vec::new();
+
+        for (filename, blob) in &blobs {
+            for local_tag in self.get_tags(&filename, blob.clone()) {
+                local_tags.push(local_tag.clone());
+            }
+        }
+
+        Ok(local_tags)
     }
 }
 
@@ -263,8 +424,12 @@ fn main() -> anyhow::Result<()> {
     let repo = Repository::discover(cli.repo.unwrap_or(PathBuf::from(".")))
         .context("failed to find git repository at or above the provided directory")?;
 
-    for r#ref in cli.refs {
-        let r#ref = validate_ref_input(&mut cmd, &repo, r#ref);
+    // TODO: Add support for --all flag
+    let mut lead_refs = Vec::new();
+
+    for ref_name in &cli.refs {
+        lead_refs.push(validate_ref_input(&mut cmd, &repo, ref_name));
+        let r#ref = validate_ref_input(&mut cmd, &repo, ref_name);
         walk.push_start_oid(r#ref.peel_to_commit()?.id());
     }
 
@@ -303,7 +468,7 @@ fn main() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut hunks: HashMap<ChangedFile, Vec<Hunk>> = HashMap::new();
 
-    for commit in commits {
+    for commit in &commits {
         let parents = commit.parents().collect::<Vec<_>>();
         let new_tree = commit.tree()?;
 
@@ -333,13 +498,23 @@ fn main() -> anyhow::Result<()> {
                     return true;
                 }
 
-                let filename = get_diff_delta_path(&delta).unwrap();
+                let filename = get_diff_delta_path(&delta)
+                    .expect("failed to get the path of the changed file");
+
+                if !filename.to_lowercase().ends_with(".java") {
+                    return true;
+                }
+
                 let old_file = delta.old_file().id();
                 let new_file = delta.new_file().id();
 
                 let changed_file = ChangedFile::new(filename, old_file, new_file, commit.id());
 
-                hunks.entry(changed_file).or_default().push(Hunk::from(hunk));
+                hunks
+                    .entry(changed_file)
+                    .or_default()
+                    .push(hunk.try_into().expect("failed to convert hunk"));
+
                 return true;
             }),
             None,
@@ -348,5 +523,113 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("Found {} changed files in {}ms", hunks.len(), start.elapsed().as_millis());
+
+    extern "C" {
+        fn tree_sitter_java() -> Language;
+    }
+
+    let language = unsafe { tree_sitter_java() };
+    let java_query = include_str!("../queries/java/tags.scm");
+    let mut tag_gen = TagGenerator::new(language, java_query)?;
+    let mut change_gen = ChangeGenerator::new(&mut tag_gen, &repo);
+
+    let start = Instant::now();
+
+    let mut changes = Vec::new();
+
+    for (changed_file, hunks) in &hunks {
+        for change in change_gen.generate_changes(changed_file, hunks) {
+            println!("{:?}", change);
+            changes.push(change);
+        }
+
+        println!()
+    }
+
+    log::info!("Generated changes in {}ms", start.elapsed().as_millis());
+
+    // Calculate presence
+    let mut local_tags = Vec::new();
+
+    for lead_ref in &lead_refs {
+        let lead_ref_name = lead_ref.name().context("expected a named ref")?;
+        log::info!("Finding tags present in {}...", lead_ref_name);
+        let tree = &lead_ref.peel_to_tree()?;
+        for local_tag in change_gen.generate_presence(tree)? {
+            local_tags.push(local_tag);
+        }
+    }
+
+    let start = Instant::now();
+    let mut entity_vt = EntityVirtualTable::new();
+
+    for local_tag in local_tags {
+        insert_tag(&mut entity_vt, local_tag.tag);
+    }
+
+    log::info!(
+        "Inserted {} entitities into the virtual table in {}ms",
+        entity_vt.len(),
+        start.elapsed().as_millis()
+    );
+
+    let start = Instant::now();
+    let mut commit_vt = CommitVirtualTable::new();
+
+    for commit in &commits {
+        insert_commit(&mut commit_vt, commit);
+    }
+
+    log::info!(
+        "Inserted {} commits into the virtual table in {}ms",
+        commit_vt.len(),
+        start.elapsed().as_millis()
+    );
+
+    let start = Instant::now();
+    let mut change_vt = ChangeVirtualTable::new();
+
+    for change in &changes {
+        insert_change(&mut commit_vt, &mut entity_vt, &mut change_vt, change);
+    }
+
+    log::info!(
+        "Inserted {} commits into the virtual table in {}ms",
+        commit_vt.len(),
+        start.elapsed().as_millis()
+    );
+
+    let mut db = Connection::open(cli.db)?;
+
+    let init_script = include_str!("../sql/init_entities.sql");
+    db.execute(init_script, params![])?;
+    let init_script = include_str!("../sql/init_commits.sql");
+    db.execute(init_script, params![])?;
+    let init_script = include_str!("../sql/init_changes.sql");
+    db.execute(init_script, params![])?;
+
+    let start = Instant::now();
+    let tx = db.transaction()?;
+    entity_vt.write::<EntityWriter>(&tx)?;
+    commit_vt.write::<CommitWriter>(&tx)?;
+    change_vt.write::<ChangeWriter>(&tx)?;
+    tx.commit()?;
+    log::info!("Wrote virtual tables to disk in {}ms", start.elapsed().as_millis());
+
     Ok(())
+}
+
+pub fn insert_change(
+    commit_vt: &mut CommitVirtualTable,
+    entity_vt: &mut EntityVirtualTable,
+    change_vt: &mut ChangeVirtualTable,
+    change: &Change,
+) -> Id {
+    let commit_id = commit_vt.get_id(&CommitKey::new(change.commit.to_string())).unwrap();
+    let entity_id = insert_tag(entity_vt, change.tag.clone());
+
+    let change_key = ChangeKey::new(commit_id, entity_id);
+    let change_extra = ChangeExtra::new(change.kind, change.adds, change.dels);
+
+    change_vt.insert(change_key, change_extra)
 }

@@ -19,3 +19,5 @@
 (field_declaration
   declarator: (variable_declarator
     name: (identifier) @name)) @tag.field
+
+; TODO: What about annotations?

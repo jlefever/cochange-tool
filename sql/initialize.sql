@@ -3,17 +3,23 @@ CREATE TABLE entities (
     parent_id INT,
     name TEXT NOT NULL,
     kind TEXT NOT NULL,
-    extra TEXT,
+    -- extra TEXT,
     
     FOREIGN KEY(parent_id) REFERENCES entities(id),
-    UNIQUE(parent_id, name, kind, extra)
+    CHECK((kind == 'file' AND parent_id IS NULL) OR
+          (kind != 'file' AND parent_id IS NOT NULL)),
+    UNIQUE(parent_id, name, kind)
 ) WITHOUT ROWID;
 
 CREATE TABLE commits (
     id INT NOT NULL PRIMARY KEY,
     sha1 CHAR(40) NOT NULL UNIQUE,
     is_merge BOOLEAN NOT NULL,
+    -- author_name TEXT,
+    -- author_mail TEXT,
     author_date INT NOT NULL,
+    -- commit_name TEXT,
+    -- commit_mail TEXT,
     commit_date INT NOT NULL,
 
     has_change_info BOOLEAN NOT NULL,
@@ -39,7 +45,7 @@ CREATE TABLE changes (
 
     FOREIGN KEY(commit_id) REFERENCES commits(id),
     FOREIGN KEY(entity_id) REFERENCES entities(id),
-    UNIQUE(entity_id, sha1),
+    UNIQUE(commit_id, entity_id),
     CHECK(kind = 'A' OR kind = 'D' or kind = 'M'),
     CHECK(adds > 0 OR dels > 0)
 ) WITHOUT ROWID;
