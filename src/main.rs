@@ -10,6 +10,8 @@ mod gtl;
 mod ir;
 mod parsing;
 
+use std::fs::remove_file;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -78,6 +80,10 @@ struct Cli {
     /// Path to the database of co-change data.
     #[clap(help_heading = "I/O", long)]
     db: PathBuf,
+
+    /// Forcefully overwrite existing database.
+    #[clap(help_heading = "I/O", long)]
+    force: bool,
 
     /// Limit the number of commits to process (i.e. extract (co-)change
     /// information from).
@@ -259,6 +265,16 @@ fn main() -> anyhow::Result<()> {
     let cli = <Cli as clap::Parser>::parse();
     env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
 
+    // Check if database already exists
+    if !cli.force && Path::new(&cli.db).exists() {
+        let msg = format!(
+            "The database ('{}') already exists. Use --force to overwrite it. (Updating databases \
+             is not yet supported.)",
+            &cli.db.to_string_lossy()
+        );
+        cmd.error(clap::ErrorKind::Io, msg).exit();
+    }
+
     // Open repository
     let repo_path = cli.repo.clone().unwrap_or(PathBuf::from("."));
     let repo = Repository::discover(repo_path)
@@ -322,6 +338,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     log::info!("Populated virtual database in {}ms", start.elapsed().as_millis());
+
+    // Delete database if --force is given
+    if cli.force && Path::new(&cli.db).exists() {
+        log::warn!("Overwriting existing database ('{}')...", &cli.db.to_string_lossy());
+        remove_file(&cli.db)?;
+    }
 
     // Write virtual database to real (on disk) database
     let start = Instant::now();
