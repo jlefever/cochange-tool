@@ -5,34 +5,42 @@ extern crate derive_builder;
 extern crate derive_new;
 
 mod db;
+mod extraction;
+mod gtl;
 mod ir;
-mod persistence;
-mod tagging;
-mod time;
-mod walking;
+mod parsing;
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use ::time::format_description::well_known::Iso8601;
-use ::time::{Date, OffsetDateTime, PrimitiveDateTime, Time};
-use anyhow::{bail, Context};
-use clap::{App, CommandFactory};
-use clap_verbosity_flag::{InfoLevel, Verbosity};
-use git2::{
-    Commit, Delta, DiffDelta, DiffHunk, DiffOptions, Oid, Reference, Repository, Sort,
-    TreeWalkMode, TreeWalkResult,
-};
+use ::time::Date;
+use ::time::OffsetDateTime;
+use ::time::PrimitiveDateTime;
+use ::time::Time;
+use anyhow::Context;
+use clap::App;
+use clap::CommandFactory;
+use clap_verbosity_flag::InfoLevel;
+use clap_verbosity_flag::Verbosity;
+use git2::Reference;
+use git2::Repository;
+use git2::Sort;
+use parsing::FileParser;
 use rusqlite::Connection;
 use tree_sitter::Language;
 
+use crate::db::insert_change;
+use crate::db::insert_presence;
+use crate::db::insert_ref;
 use crate::db::VirtualDb;
+use crate::extraction::diff_all_files;
+use crate::extraction::get_changes;
+use crate::extraction::get_presences;
+use crate::extraction::CommitWalk;
+use crate::extraction::ExtractionCtx;
+use crate::extraction::RefGlobKind;
 use crate::ir::*;
-use crate::persistence::{insert_change, insert_commit, insert_presence, insert_ref};
-use crate::tagging::TagGenerator;
-use crate::walking::{CommitWalk, RefGlobKind};
 
 /// Iterates through the commit history of a git repository and stores the
 /// (co-)change information of each semantic entity encountered. A "semantic
@@ -168,385 +176,149 @@ fn parse_time_input<S: AsRef<str>>(text: S) -> Option<OffsetDateTime> {
     None
 }
 
-fn validate_time_input(app: &mut App, input: String, argument: &'static str) -> OffsetDateTime {
+fn validate_time_input<S: AsRef<str>>(
+    app: &mut App,
+    input: S,
+    argument: &'static str,
+) -> OffsetDateTime {
     match parse_time_input(&input) {
         Some(datetime) => datetime,
         None => {
             let msg = format!(
                 "The value ('{}') supplied to '{}' is not an ISO 8601 date or a duration.",
-                &input, &argument
+                input.as_ref(),
+                &argument
             );
             app.error(clap::ErrorKind::ValueValidation, msg).exit();
         }
     }
 }
 
-fn validate_ref_input<'r>(app: &mut App, repo: &'r Repository, input: &String) -> Reference<'r> {
-    match repo.resolve_reference_from_short_name(input) {
+fn validate_ref_input<'r, S: AsRef<str>>(
+    app: &mut App,
+    repo: &'r Repository,
+    input: S,
+) -> Reference<'r> {
+    match repo.resolve_reference_from_short_name(input.as_ref()) {
         Ok(reference) => reference,
         Err(_) => {
-            let msg = format!("The given ref ('{}') was not found in this repository", input);
+            let msg =
+                format!("The given ref ('{}') was not found in this repository", input.as_ref());
             app.error(clap::ErrorKind::ValueValidation, msg).exit();
         }
     }
 }
 
-impl TryFrom<DiffHunk<'_>> for Hunk {
-    type Error = anyhow::Error;
-
-    fn try_from(diff_hunk: DiffHunk<'_>) -> Result<Self, Self::Error> {
-        // Avoid underflows
-        if diff_hunk.old_start() == 0 || diff_hunk.new_start() == 0 {
-            log::warn!("Found zero-based index: {:?}", diff_hunk);
-            // bail!("expected one-based index");
-        }
-
-        // Convert to zero-based index
-        let old_start = diff_hunk.old_start() - 1;
-        let new_start = diff_hunk.new_start() - 1;
-
-        // Convert to usize
-        let old_start: usize = old_start.try_into()?;
-        let new_start: usize = new_start.try_into()?;
-        let old_lines: usize = diff_hunk.old_lines().try_into()?;
-        let new_lines: usize = diff_hunk.new_lines().try_into()?;
-
-        Ok(Hunk::new(
-            Interval(old_start, old_start + old_lines),
-            Interval(new_start, new_start + new_lines),
-        ))
+fn get_lead_refs(cmd: &mut App, cli: &Cli, repo: &Repository) -> anyhow::Result<Vec<Ref>> {
+    if cli.all {
+        return Ok(repo.references()?.map(|r| gtl::to_ref(&r.unwrap())).try_collect::<Vec<_>>()?);
     }
+
+    let mut lead_refs = Vec::new();
+
+    for ref_name in &cli.refs {
+        lead_refs.push(gtl::to_ref(&validate_ref_input(cmd, &repo, ref_name))?);
+    }
+
+    Ok(lead_refs)
 }
 
-fn get_diff_delta_path(diff_delta: &DiffDelta) -> anyhow::Result<String> {
-    let old_path = diff_delta.old_file().path();
-    let new_path = diff_delta.new_file().path();
-
-    Ok(match (old_path, new_path) {
-        (None, None) => bail!("at least one side of diff must be non-empty"),
-        (None, Some(path)) => path,
-        (Some(path), None) => path,
-        (Some(old_path), Some(new_path)) => {
-            if old_path != new_path {
-                bail!("renames and moves are not supported");
-            } else {
-                old_path
-            }
-        }
-    }
-    .to_string_lossy()
-    .to_string())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct ChangedFile {
-    filename: String,
-    old_file: Oid,
-    new_file: Oid,
-    commit: Oid,
-}
-
-impl ChangedFile {
-    fn new(filename: String, old_file: Oid, new_file: Oid, commit: Oid) -> Self {
-        Self { filename, old_file, new_file, commit }
-    }
-}
-
-struct ChangeGenerator<'t, 'r> {
-    cache: HashMap<(String, Oid), Vec<LocalTag>>,
-    tag_gen: &'t mut TagGenerator,
-    repo: &'r Repository,
-}
-
-impl<'t, 'r> ChangeGenerator<'t, 'r> {
-    fn new(tag_gen: &'t mut TagGenerator, repo: &'r Repository) -> Self {
-        Self { cache: HashMap::new(), tag_gen, repo }
-    }
-
-    fn get_tags(&mut self, filename: &String, blob: Oid) -> &Vec<LocalTag> {
-        self.cache.entry((filename.clone(), blob)).or_insert_with(|| {
-            if blob.is_zero() {
-                return Vec::new();
-            }
-
-            self.tag_gen
-                .generate_tags(filename, self.repo.find_blob(blob).unwrap().content())
-                .unwrap()
-        })
-    }
-
-    fn generate_changes(&mut self, changed_file: &ChangedFile, hunks: &Vec<Hunk>) -> Vec<Change> {
-        // Tree-sitter uses zero-based indices for rows and colums
-        // What about git-diff? I think its one-based.
-        // TODO: Confirm that git-diff is one-based.
-        // TODO: Check the inclusivity/exclusivity of the endpoints
-        let mut changes: HashMap<Arc<Tag>, ChangeBuilder> = HashMap::new();
-
-        let filename = &changed_file.filename;
-        let old_file = changed_file.old_file;
-        let new_file = changed_file.new_file;
-
-        for old_tag in self.get_tags(filename, old_file) {
-            let dels = hunks.iter().map(|h| h.old_interval.intersect(&old_tag.interval)).sum();
-
-            if dels > 0 {
-                changes.entry(old_tag.tag.clone()).or_default().dels(dels);
-            }
-        }
-
-        for new_tag in self.get_tags(filename, new_file) {
-            let adds = hunks.iter().map(|h| h.new_interval.intersect(&new_tag.interval)).sum();
-
-            if adds > 0 {
-                changes.entry(new_tag.tag.clone()).or_default().adds(adds);
-            }
-        }
-
-        let old_tags =
-            self.get_tags(filename, old_file).iter().map(|t| t.tag.clone()).collect::<HashSet<_>>();
-        let new_tags =
-            self.get_tags(filename, new_file).iter().map(|t| t.tag.clone()).collect::<HashSet<_>>();
-
-        for deleted in old_tags.difference(&new_tags) {
-            changes.entry(deleted.clone()).or_default().kind(ChangeKind::Deleted);
-        }
-
-        for created in new_tags.difference(&old_tags) {
-            changes.entry(created.clone()).or_default().kind(ChangeKind::Added);
-        }
-
-        changes
-            .into_iter()
-            .map(|(tag, mut change)| change.tag(tag).commit(changed_file.commit).build().unwrap())
-            .collect()
-    }
-
-    fn generate_presence(&mut self, commit: &Commit) -> anyhow::Result<Vec<Presence>> {
-        let mut blobs = Vec::new();
-
-        commit.tree()?.walk(TreeWalkMode::PreOrder, |dir, entry| {
-            if !matches!(entry.kind().unwrap(), git2::ObjectType::Blob) {
-                return TreeWalkResult::Ok;
-            }
-
-            let filename = format!("{}{}", dir, entry.name().unwrap());
-
-            if !filename.ends_with(".java") {
-                return TreeWalkResult::Ok;
-            }
-
-            let blob = entry.to_object(self.repo).unwrap().id();
-            blobs.push((filename, blob));
-            TreeWalkResult::Ok
-        })?;
-
-        let mut presences = Vec::new();
-
-        for (filename, blob) in &blobs {
-            for local_tag in self.get_tags(&filename, blob.clone()) {
-                presences.push(Presence::new(local_tag.clone(), commit.id()));
-            }
-        }
-
-        Ok(presences)
-    }
-}
-
-fn generate_hunks(
-    repo: &Repository,
-    commits: &Vec<&Commit>,
-) -> anyhow::Result<HashMap<ChangedFile, Vec<Hunk>>> {
-    let mut hunks: HashMap<ChangedFile, Vec<Hunk>> = HashMap::new();
-
-    let mut opts = DiffOptions::new();
-    opts.ignore_filemode(true);
-    opts.ignore_whitespace(false);
-    opts.ignore_whitespace_change(false);
-    opts.ignore_whitespace_eol(false);
-    opts.ignore_blank_lines(false);
-    opts.indent_heuristic(false);
-    opts.context_lines(0);
-
-    for commit in commits {
-        let parents = commit.parents().collect::<Vec<_>>();
-        let new_tree = commit.tree()?;
-
-        let diff = match parents.len() {
-            0 => repo.diff_tree_to_tree(None, Some(&new_tree), Some(&mut opts)),
-            1 => {
-                let parent = parents.get(0).unwrap();
-                let old_tree = parent.tree()?;
-                repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
-            }
-            _ => continue,
-        }?;
-
-        diff.foreach(
-            &mut |_, _| true,
-            None,
-            Some(&mut |delta, hunk| {
-                let is_supported_status = match delta.status() {
-                    Delta::Added => true,
-                    Delta::Deleted => true,
-                    Delta::Modified => true,
-                    _ => false,
-                };
-
-                if !is_supported_status {
-                    log::warn!("Skipping unsupported diff status: {:?}", &delta.status());
-                    return true;
-                }
-
-                let filename = get_diff_delta_path(&delta)
-                    .expect("failed to get the path of the changed file");
-
-                if !filename.to_lowercase().ends_with(".java") {
-                    return true;
-                }
-
-                let old_file = delta.old_file().id();
-                let new_file = delta.new_file().id();
-
-                let changed_file = ChangedFile::new(filename, old_file, new_file, commit.id());
-
-                hunks
-                    .entry(changed_file)
-                    .or_default()
-                    .push(hunk.try_into().expect("failed to convert hunk"));
-
-                return true;
-            }),
-            None,
-        )
-        .context("failed to iterate over diff")?;
-    }
-
-    Ok(hunks)
-}
-
-fn main() -> anyhow::Result<()> {
-    let cli = <Cli as clap::Parser>::parse();
-    env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
-
-    let mut cmd = Cli::command();
-
-    // Create CommitWalk from cli input
+fn get_commit_walk(cmd: &mut App, cli: &Cli, repo: &Repository) -> anyhow::Result<CommitWalk> {
     let mut walk = CommitWalk::new();
-    let since = cli.since.map(|s| validate_time_input(&mut cmd, s, "--since"));
-    let until = cli.until.map(|s| validate_time_input(&mut cmd, s, "--until"));
+    let since = cli.since.as_ref().map(|s| validate_time_input(cmd, s, "--since"));
+    let until = cli.until.as_ref().map(|s| validate_time_input(cmd, s, "--until"));
     since.map(|s| walk.set_since(s));
     until.map(|u| walk.set_until(u));
     cli.max_count.map(|n| walk.set_max_count(n));
 
+    walk.set_sort(Sort::TIME);
+
     if cli.all {
         walk.push_glob(RefGlobKind::All, None);
+        return Ok(walk);
     }
 
-    cli.branches.map(|g| walk.push_glob(RefGlobKind::Branches, g));
-    cli.tags.map(|g| walk.push_glob(RefGlobKind::Tags, g));
-    cli.remotes.map(|g| walk.push_glob(RefGlobKind::Remotes, g));
+    cli.branches.as_ref().map(|g| walk.push_glob(RefGlobKind::Branches, g.clone()));
+    cli.tags.as_ref().map(|g| walk.push_glob(RefGlobKind::Tags, g.clone()));
+    cli.remotes.as_ref().map(|g| walk.push_glob(RefGlobKind::Remotes, g.clone()));
 
-    let repo = Repository::discover(cli.repo.unwrap_or(PathBuf::from(".")))
+    for ref_name in &cli.refs {
+        let r#ref = validate_ref_input(cmd, &repo, ref_name);
+        walk.push_start_oid(r#ref.peel_to_commit()?.id());
+    }
+
+    Ok(walk)
+}
+
+extern "C" {
+    fn tree_sitter_java() -> Language;
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut cmd = Cli::command();
+    let cli = <Cli as clap::Parser>::parse();
+    env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
+
+    // Open repository
+    let repo_path = cli.repo.clone().unwrap_or(PathBuf::from("."));
+    let repo = Repository::discover(repo_path)
         .context("failed to find git repository at or above the provided directory")?;
-
-    // Idea: Maybe only use --all to determine changes
-    // If presence is desired, it needs to be explicitly listed on the command line
-    let mut lead_refs = Vec::new();
-
-    if cli.all {
-        for r#ref in repo.references()? {
-            lead_refs.push(r#ref?);
-        }
-    } else {
-        for ref_name in &cli.refs {
-            lead_refs.push(validate_ref_input(&mut cmd, &repo, ref_name));
-            let r#ref = validate_ref_input(&mut cmd, &repo, ref_name);
-            walk.push_start_oid(r#ref.peel_to_commit()?.id());
-        }
-    }
 
     // This is a necessary config for Windows. Even though we never touch the actual
     // filesystem, because libgit2 emulates the behavior of the real git, it will
     // still crash on Windows when encountering especially long paths.
     repo.config()?.set_bool("core.longpaths", true)?;
 
+    // Setup tree sitter
+    let language = unsafe { tree_sitter_java() };
+    let java_query = include_str!("../queries/java/tags.scm");
+    let parsing_ctx = FileParser::new(language, java_query)?;
+    let mut cache = ExtractionCtx::new(&repo, parsing_ctx);
+
     // Initial collection of commits into HashMap
     // We walk in reverse chronological order. This is to ensure the "-n" flag works
     // as expected. For instance, "-n 50" should fetch the 50 most recent commits.
+    let walk = get_commit_walk(&mut cmd, &cli, &repo)?;
     let start = Instant::now();
-    walk.set_sort(Sort::TIME);
-    let commits = walk.clone().walk(&repo)?;
-    let commits = commits.map(|res| res.map(|c| (c.id(), c))).try_collect::<HashMap<_, _>>()?;
+    let commits = walk.walk(&repo)?.try_collect::<Vec<_>>()?;
     log::info!("Found {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
-
-    // Re-order commits topologically.
-    // Not sure if this is necessary anymore.
-    let start = Instant::now();
-    walk.set_sort(Sort::TOPOLOGICAL | Sort::REVERSE);
-    let revwalk = walk.revwalk(&repo)?;
-    let commits = revwalk.filter_map(|res| commits.get(&res.unwrap())).collect::<Vec<_>>();
-    log::info!("Re-ordered {} commits in {}ms.", commits.len(), start.elapsed().as_millis());
 
     // Collect changed files
     let start = Instant::now();
-    let hunks = generate_hunks(&repo, &commits)?;
-    log::info!("Found {} changed files in {}ms", hunks.len(), start.elapsed().as_millis());
+    let diffed_files = diff_all_files(&repo, &commits, ".java")?;
+    log::info!("Found {} changed files in {}ms", diffed_files.len(), start.elapsed().as_millis());
 
-    // Setup tree sitter
-    extern "C" {
-        fn tree_sitter_java() -> Language;
-    }
-
-    let language = unsafe { tree_sitter_java() };
-    let java_query = include_str!("../queries/java/tags.scm");
-    let mut tag_gen = TagGenerator::new(language, java_query)?;
-    let mut change_gen = ChangeGenerator::new(&mut tag_gen, &repo);
-
+    // Calculate changes
     let start = Instant::now();
-
-    let mut changes = Vec::new();
-
-    for (changed_file, hunks) in &hunks {
-        for change in change_gen.generate_changes(changed_file, hunks) {
-            // println!("{:?}", change);
-            changes.push(change);
-        }
-
-        // println!()
-    }
-
+    let changes = diffed_files
+        .iter()
+        .flat_map(|diffed_file| get_changes(&mut cache, diffed_file).unwrap())
+        .collect::<Vec<_>>();
     log::info!("Generated changes in {}ms", start.elapsed().as_millis());
 
     // Calculate presence
-    let mut presences = Vec::new();
-
-    for lead_ref in &lead_refs {
-        let lead_ref_name = lead_ref.name().context("expected a named ref")?;
-        log::info!("Finding tags present in {}...", lead_ref_name);
-        let commit = &lead_ref.peel_to_commit()?;
-        for presence in change_gen.generate_presence(commit)? {
-            presences.push(presence);
-        }
-    }
+    let lead_refs = get_lead_refs(&mut cmd, &cli, &repo)?;
+    let start = Instant::now();
+    let presences = lead_refs
+        .iter()
+        .flat_map(|r| get_presences(&mut cache, &r.commit, ".java").unwrap())
+        .collect::<Vec<_>>();
+    log::info!("Generated presences in {}ms", start.elapsed().as_millis());
 
     // Create and insert into virtual database
     let mut db = VirtualDb::new();
     let start = Instant::now();
 
-    for commit in &commits {
-        insert_commit(&mut db, commit);
-    }
-
-    for r#ref in &lead_refs {
-        insert_ref(&mut db, r#ref);
+    for change in &changes {
+        insert_change(&mut db, change)?;
     }
 
     for presence in &presences {
-        insert_presence(&mut db, presence);
+        insert_presence(&mut db, presence)?;
     }
 
-    for change in &changes {
-        insert_change(&mut db, change);
+    for r#ref in &lead_refs {
+        insert_ref(&mut db, r#ref)?;
     }
 
     log::info!("Populated virtual database in {}ms", start.elapsed().as_millis());

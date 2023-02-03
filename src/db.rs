@@ -1,19 +1,24 @@
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::hash::Hash;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
+use anyhow::Result;
 use derive_new::new;
-use rusqlite::{params, CachedStatement, Transaction};
+use rusqlite::params;
+use rusqlite::CachedStatement;
+use rusqlite::Transaction;
 
-use crate::ir::{ChangeKind, CommitInfo};
+use crate::ir::*;
 
 pub type Id = usize;
 
 pub trait SqlWriter<'a, K: Hash + Eq, E> {
     fn create_table_script() -> &'static str;
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self>
+    fn prepare(tx: &'a Transaction) -> Result<Self>
     where
         Self: Sized;
-    fn execute(&mut self, id: Id, key: &K, extra: &E) -> anyhow::Result<usize>;
+    fn execute(&mut self, id: Id, key: &K, extra: &E) -> Result<usize>;
 }
 
 #[derive(Debug, Default)]
@@ -24,15 +29,18 @@ pub struct VirtualTable<K: Default + Hash + Eq, E: Default> {
 
 impl<K: Default + Hash + Eq, E: Default> VirtualTable<K, E> {
     /// Creates a new [`VirtualTable<K, E>`].
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Returns the length of this [`VirtualTable<K, E>`].
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[allow(dead_code)]
     pub fn get_id(&self, key: &K) -> Option<Id> {
         self.map.get(key).map(|(_, id)| *id)
     }
@@ -47,7 +55,7 @@ impl<K: Default + Hash + Eq, E: Default> VirtualTable<K, E> {
         *id
     }
 
-    pub fn write<'a, W: SqlWriter<'a, K, E>>(self, tx: &'a Transaction) -> anyhow::Result<()> {
+    pub fn write<'a, W: SqlWriter<'a, K, E>>(self, tx: &'a Transaction) -> Result<()> {
         // Create table
         tx.execute(W::create_table_script(), params![])?;
 
@@ -103,12 +111,12 @@ impl<'a> SqlWriter<'a, EntityKey, NullExtra> for EntityWriter<'a> {
         ) WITHOUT ROWID;"
     }
 
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
         let sql = "INSERT INTO entities (id, parent_id, name, kind) VALUES (?, ?, ?, ?);";
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
-    fn execute(&mut self, id: Id, key: &EntityKey, _: &NullExtra) -> anyhow::Result<usize> {
+    fn execute(&mut self, id: Id, key: &EntityKey, _: &NullExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![id, key.parent_id, key.name, key.kind])?)
     }
 }
@@ -155,7 +163,7 @@ impl<'a> SqlWriter<'a, CommitKey, CommitExtra> for CommitWriter<'a> {
         ) WITHOUT ROWID;"
     }
 
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
         let sql = "INSERT INTO commits (id
                                       , sha1
                                       , is_merge
@@ -168,7 +176,7 @@ impl<'a> SqlWriter<'a, CommitKey, CommitExtra> for CommitWriter<'a> {
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
-    fn execute(&mut self, id: Id, k: &CommitKey, e: &CommitExtra) -> anyhow::Result<usize> {
+    fn execute(&mut self, id: Id, k: &CommitKey, e: &CommitExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![
             id,
             k.sha1,
@@ -213,12 +221,12 @@ impl<'a> SqlWriter<'a, RefKey, RefExtra> for RefWriter<'a> {
         ) WITHOUT ROWID;"
     }
 
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
         let sql = "INSERT INTO refs (id, commit_id, name) VALUES (?, ?, ?);";
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
-    fn execute(&mut self, id: Id, k: &RefKey, e: &RefExtra) -> anyhow::Result<usize> {
+    fn execute(&mut self, id: Id, k: &RefKey, e: &RefExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![id, e.commit_id, k.name])?)
     }
 }
@@ -264,7 +272,7 @@ impl<'a> SqlWriter<'a, ChangeKey, ChangeExtra> for ChangeWriter<'a> {
         ) WITHOUT ROWID;"
     }
 
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
         let sql = "INSERT INTO changes (id
                                       , commit_id
                                       , entity_id
@@ -275,7 +283,7 @@ impl<'a> SqlWriter<'a, ChangeKey, ChangeExtra> for ChangeWriter<'a> {
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
-    fn execute(&mut self, id: Id, k: &ChangeKey, e: &ChangeExtra) -> anyhow::Result<usize> {
+    fn execute(&mut self, id: Id, k: &ChangeKey, e: &ChangeExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![
             id,
             k.commit_id,
@@ -286,65 +294,6 @@ impl<'a> SqlWriter<'a, ChangeKey, ChangeExtra> for ChangeWriter<'a> {
         ])?)
     }
 }
-
-// ========================================================
-// Range -------------------------------------------------
-// ========================================================
-
-// #[derive(new, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-// pub struct RangeKey {
-//     start_byte: usize,
-//     start_col: usize,
-//     start_row: usize,
-//     end_byte: usize,
-//     end_col: usize,
-//     end_row: usize,
-// }
-
-// pub type RangeVirtualTable = VirtualTable<RangeKey, NullExtra>;
-
-// pub struct RangeWriter<'a> {
-//     stmt: CachedStatement<'a>,
-// }
-
-// impl<'a> SqlWriter<'a, RangeKey, NullExtra> for RangeWriter<'a> {
-//     fn create_table_script() -> &'static str {
-//         "CREATE TABLE ranges (
-//             id INT NOT NULL PRIMARY KEY,
-//             start_byte INT NOT NULL,
-//             start_col INT NOT NULL,
-//             start_row INT NOT NULL,
-//             end_byte INT NOT NULL,
-//             end_col INT NOT NULL,
-//             end_row INT NOT NULL,
-
-//             UNIQUE(start_byte, start_col, start_row, end_byte, end_col,
-// end_row)         ) WITHOUT ROWID;"
-//     }
-
-//     fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
-//         let sql = "INSERT INTO ranges (id
-//                                      , start_byte
-//                                      , start_col
-//                                      , start_row
-//                                      , end_byte
-//                                      , end_col
-//                                      , end_row)
-//                    VALUES (?, ?, ?, ?, ?, ?, ?);";
-//         Ok(Self { stmt: tx.prepare_cached(sql)? })
-//     }
-
-//     fn execute(&mut self, id: Id, k: &RangeKey, _: &NullExtra) ->
-// anyhow::Result<usize> {         Ok(self.stmt.execute(params![
-//             id,
-//             k.start_byte,
-//             k.start_col,
-//             k.end_byte,
-//             k.end_col,
-//             k.end_row
-//         ])?)
-//     }
-// }
 
 // ========================================================
 // Presence -----------------------------------------------
@@ -383,12 +332,12 @@ impl<'a> SqlWriter<'a, PresenceKey, PresenceExtra> for PresenceWriter<'a> {
         ) WITHOUT ROWID;"
     }
 
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
         let sql = "INSERT INTO presence (id, commit_id, entity_id, start_row, end_row) VALUES (?, ?, ?, ?, ?);";
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
-    fn execute(&mut self, id: Id, k: &PresenceKey, e: &PresenceExtra) -> anyhow::Result<usize> {
+    fn execute(&mut self, id: Id, k: &PresenceKey, e: &PresenceExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![id, k.commit_id, k.entity_id, e.start_row, e.end_row])?)
     }
 }
@@ -422,12 +371,12 @@ impl<'a> SqlWriter<'a, ReachabilityKey, NullExtra> for ReachabilityWriter<'a> {
         ) WITHOUT ROWID;"
     }
 
-    fn prepare(tx: &'a Transaction) -> anyhow::Result<Self> {
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
         let sql = "INSERT INTO reachability (id, source_id, target_id) VALUES (?, ?, ?);";
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
-    fn execute(&mut self, id: Id, k: &ReachabilityKey, _: &NullExtra) -> anyhow::Result<usize> {
+    fn execute(&mut self, id: Id, k: &ReachabilityKey, _: &NullExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![id, k.source_id, k.target_id])?)
     }
 }
@@ -452,7 +401,7 @@ impl VirtualDb {
         Self::default()
     }
 
-    pub fn write<'a>(self, tx: &'a Transaction) -> anyhow::Result<()> {
+    pub fn write<'a>(self, tx: &'a Transaction) -> Result<()> {
         self.entity_vt.write::<EntityWriter>(&tx)?;
         self.commit_vt.write::<CommitWriter>(&tx)?;
         self.ref_vt.write::<RefWriter>(&tx)?;
@@ -462,4 +411,57 @@ impl VirtualDb {
         self.reachability_vt.write::<ReachabilityWriter>(&tx)?;
         Ok(())
     }
+}
+
+pub fn insert_entity<E: Borrow<Entity>>(db: &mut VirtualDb, entity: E) -> Result<Id> {
+    let mut prev_id = None;
+
+    for (name, kind) in entity.borrow().to_vec() {
+        let key = EntityKey::new(prev_id, name, kind);
+        prev_id = Some(db.entity_vt.insert(key, NullExtra));
+    }
+
+    Ok(prev_id.unwrap())
+}
+
+pub fn insert_commit(db: &mut VirtualDb, commit: &Commit) -> Result<Id> {
+    let key = CommitKey::new(commit.sha1.to_string());
+    let extra = CommitExtra::new(
+        commit.is_merge,
+        commit.author_date.unix_timestamp(),
+        commit.commit_date.unix_timestamp(),
+        CommitInfo::empty(),
+    );
+    Ok(db.commit_vt.insert(key, extra))
+}
+
+pub fn insert_change(db: &mut VirtualDb, change: &Change) -> Result<Id> {
+    let commit_id = insert_commit(db, &change.commit)?;
+    let entity_id = insert_entity(db, change.entity.clone())?;
+
+    let change_key = ChangeKey::new(commit_id, entity_id);
+    let change_extra = ChangeExtra::new(change.kind, change.adds, change.dels);
+
+    Ok(db.change_vt.insert(change_key, change_extra))
+}
+
+pub fn insert_presence(db: &mut VirtualDb, presence: &Presence) -> Result<Id> {
+    let commit_id = insert_commit(db, &presence.commit)?;
+    let entity_id = insert_entity(db, presence.loc_entity.entity.clone())?;
+
+    let interval = presence.loc_entity.loc;
+
+    let presence_key = PresenceKey::new(commit_id, entity_id);
+    let presence_extra = PresenceExtra::new(interval.0, interval.1);
+
+    Ok(db.presence_vt.insert(presence_key, presence_extra))
+}
+
+pub fn insert_ref<'r>(db: &mut VirtualDb, r#ref: &Ref) -> Result<Id> {
+    let commit_id = insert_commit(db, &r#ref.commit)?;
+
+    let ref_key = RefKey::new(r#ref.name.clone());
+    let ref_extra = RefExtra::new(commit_id);
+
+    Ok(db.ref_vt.insert(ref_key, ref_extra))
 }

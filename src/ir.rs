@@ -1,18 +1,19 @@
 use bitflags::bitflags;
 use derive_new::new;
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 use git2::Oid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Tag {
+pub struct Entity {
     pub name: String,
-    pub parent: Option<Arc<Tag>>,
+    pub parent: Option<Arc<Entity>>,
     pub kind: Arc<String>,
 }
 
-impl Tag {
-    pub fn new(parent: Arc<Tag>, name: String, kind: Arc<String>) -> Self {
+impl Entity {
+    pub fn new(parent: Arc<Entity>, name: String, kind: Arc<String>) -> Self {
         Self { name, parent: Some(parent), kind }
     }
 
@@ -47,9 +48,9 @@ impl Interval {
 }
 
 #[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LocalTag {
-    pub tag: Arc<Tag>,
-    pub interval: Interval,
+pub struct LocEntity {
+    pub entity: Arc<Entity>,
+    pub loc: Interval,
 }
 
 #[derive(new, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,22 +59,26 @@ pub struct Hunk {
     pub new_interval: Interval,
 }
 
+#[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Commit {
+    pub sha1: Oid,
+    pub is_merge: bool,
+    pub author_date: OffsetDateTime,
+    pub commit_date: OffsetDateTime,
+}
+
+#[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Presence {
+    pub loc_entity: LocEntity,
+    pub commit: Commit,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ChangeKind {
     Added,
     #[default]
     Modified,
     Deleted,
-}
-
-impl ChangeKind {
-    pub fn to_char(&self) -> char {
-        self.into()
-    }
-
-    pub fn to_string(&self) -> String {
-        self.to_char().to_string()
-    }
 }
 
 impl From<&ChangeKind> for char {
@@ -86,10 +91,20 @@ impl From<&ChangeKind> for char {
     }
 }
 
+impl ChangeKind {
+    pub fn to_char(&self) -> char {
+        self.into()
+    }
+
+    pub fn to_string(&self) -> String {
+        self.to_char().to_string()
+    }
+}
+
 #[derive(Builder, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Change {
-    pub tag: Arc<Tag>,
-    pub commit: Oid,
+    pub entity: Arc<Entity>,
+    pub commit: Commit,
     #[builder(default)]
     pub kind: ChangeKind,
     #[builder(default)]
@@ -99,9 +114,18 @@ pub struct Change {
 }
 
 #[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Presence {
-    pub local_tag: LocalTag,
-    pub commit: Oid,
+pub struct Ref {
+    pub commit: Commit,
+    pub name: String,
+}
+
+#[derive(new, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DiffedFile {
+    pub filename: String,
+    pub commit: Commit,
+    pub old_file: Oid,
+    pub new_file: Oid,
+    pub hunks: Vec<Hunk>,
 }
 
 bitflags! {

@@ -1,4 +1,8 @@
-use_small_heuristics="Max"
-normalize_comments=true
-normalize_doc_attribute=true
+use_small_heuristics = "Max"
+normalize_comments = true
+normalize_doc_attribute = true
 wrap_comments = true
+imports_granularity = "Item"
+imports_layout = "HorizontalVertical"
+reorder_imports = true
+group_imports = "StdExternalCrate"
