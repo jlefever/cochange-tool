@@ -87,7 +87,7 @@ impl FileParser {
 }
 
 fn to_interval(range: &Range) -> Interval {
-    Interval(range.start_point.row, range.end_point.row)
+    Interval(range.start_point.row + 1, range.end_point.row + 1)
 }
 
 fn get_ancestor_ids(node: &Node) -> Vec<usize> {
