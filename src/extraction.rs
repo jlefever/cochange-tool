@@ -136,6 +136,7 @@ impl<'r> Iterator for CommitWalkIterator<'r> {
                 continue;
             }
 
+            self.count += 1;
             return Some(Ok(commit));
         }
 
@@ -170,19 +171,8 @@ impl TryFrom<git2::DiffHunk<'_>> for ir::Hunk {
     type Error = anyhow::Error;
 
     fn try_from(diff_hunk: git2::DiffHunk<'_>) -> Result<Self, Self::Error> {
-        // Avoid underflows
-        if diff_hunk.old_start() == 0 || diff_hunk.new_start() == 0 {
-            log::warn!("Found zero-based index: {:?}", diff_hunk);
-            // bail!("expected one-based index");
-        }
-
-        // Convert to zero-based index
-        let old_start = diff_hunk.old_start() - 1;
-        let new_start = diff_hunk.new_start() - 1;
-
-        // Convert to usize
-        let old_start: usize = old_start.try_into()?;
-        let new_start: usize = new_start.try_into()?;
+        let old_start: usize = diff_hunk.old_start().try_into()?;
+        let new_start: usize = diff_hunk.new_start().try_into()?;
         let old_lines: usize = diff_hunk.old_lines().try_into()?;
         let new_lines: usize = diff_hunk.new_lines().try_into()?;
 
@@ -356,10 +346,11 @@ pub fn diff_all_files(
 
                 let diffed_file =
                     diffed_files.entry((filename.clone(), commit.id())).or_insert_with(|| {
-                        gtl::to_diffed_file(filename, commit, &delta)
+                        gtl::to_diffed_file(filename.clone(), commit, &delta)
                             .expect("failed to create a diffed file")
                     });
 
+                log::trace!("commit: {}; file: {}", commit.id(), filename);
                 diffed_file.hunks.push(hunk.try_into().expect("failed to convert hunk"));
                 true
             }),
