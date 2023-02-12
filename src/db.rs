@@ -333,12 +333,64 @@ impl<'a> SqlWriter<'a, PresenceKey, PresenceExtra> for PresenceWriter<'a> {
     }
 
     fn prepare(tx: &'a Transaction) -> Result<Self> {
-        let sql = "INSERT INTO presence (id, commit_id, entity_id, start_row, end_row) VALUES (?, ?, ?, ?, ?);";
+        let sql = "INSERT INTO presence (id, commit_id, entity_id, start_row, end_row) VALUES (?, \
+                   ?, ?, ?, ?);";
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
     fn execute(&mut self, id: Id, k: &PresenceKey, e: &PresenceExtra) -> Result<usize> {
         Ok(self.stmt.execute(params![id, k.commit_id, k.entity_id, e.start_row, e.end_row])?)
+    }
+}
+
+// ========================================================
+// Deps -----------------------------------------------
+// ========================================================
+
+#[derive(new, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DepKey {
+    commit_id: Id,
+    src_id: Id,
+    tgt_id: Id,
+    kind: String,
+}
+
+#[derive(new, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DepExtra {
+    lineno: usize,
+}
+
+pub type DepVirtualTable = VirtualTable<DepKey, DepExtra>;
+
+pub struct DepWriter<'a> {
+    stmt: CachedStatement<'a>,
+}
+
+impl<'a> SqlWriter<'a, DepKey, DepExtra> for DepWriter<'a> {
+    fn create_table_script() -> &'static str {
+        "CREATE TABLE deps (
+            id INT NOT NULL PRIMARY KEY,
+            commit_id INT NOT NULL,
+            src_id INT NOT NULL,
+            tgt_id INT NOT NULL,
+            kind TEXT NOT NULL,
+            lineno INT NOT NULL,
+        
+            FOREIGN KEY(commit_id) REFERENCES commits(id),
+            FOREIGN KEY(src_id) REFERENCES entities(id),
+            FOREIGN KEY(tgt_id) REFERENCES entities(id),
+            UNIQUE(commit_id, src_id, tgt_id, kind)
+        ) WITHOUT ROWID;"
+    }
+
+    fn prepare(tx: &'a Transaction) -> Result<Self> {
+        let sql = "INSERT INTO deps (id, commit_id, src_id, tgt_id, kind, lineno) VALUES (?, ?, \
+                   ?, ?, ?, ?);";
+        Ok(Self { stmt: tx.prepare_cached(sql)? })
+    }
+
+    fn execute(&mut self, id: Id, k: &DepKey, e: &DepExtra) -> Result<usize> {
+        Ok(self.stmt.execute(params![id, k.commit_id, k.src_id, k.tgt_id, k.kind, e.lineno])?)
     }
 }
 

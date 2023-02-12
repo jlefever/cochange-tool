@@ -9,6 +9,7 @@ mod extraction;
 mod gtl;
 mod ir;
 mod parsing;
+mod deps;
 
 use std::fs::remove_file;
 use std::path::Path;
@@ -32,10 +33,17 @@ use parsing::FileParser;
 use rusqlite::Connection;
 use tree_sitter::Language;
 
+use crate::db::DepVirtualTable;
+use crate::db::DepWriter;
 use crate::db::insert_change;
 use crate::db::insert_presence;
 use crate::db::insert_ref;
 use crate::db::VirtualDb;
+use crate::deps::get_commit_id;
+use crate::deps::insert_deps;
+use crate::deps::match_entity_id;
+use crate::deps::load_dep_file;
+use crate::deps::load_locs;
 use crate::extraction::diff_all_files;
 use crate::extraction::get_changes;
 use crate::extraction::get_presences;
@@ -44,6 +52,25 @@ use crate::extraction::ExtractionCtx;
 use crate::extraction::RefGlobKind;
 use crate::ir::*;
 
+#[derive(Debug, clap::Parser)]
+#[clap(version, author)]
+#[clap(arg_required_else_help = true)]
+struct Cli {
+    #[clap(flatten)]
+    verbose: Verbosity<InfoLevel>,
+
+    #[clap(subcommand)]
+    command: CliSubCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum CliSubCommand {
+    Dump(CliDumpCommand),
+    AddDeps(AddDeps),
+}
+
+/// Dump the co-change data of a git repository.
+///
 /// Iterates through the commit history of a git repository and stores the
 /// (co-)change information of each semantic entity encountered. A "semantic
 /// entity" is any function, method, class, etc. found inside of a source file.
@@ -63,12 +90,8 @@ use crate::ir::*;
 ///   parent to determine the (co-)changes of that commit.
 ///
 /// - Set subtraction (i.e. `foo ^bar` or `foo..bar`) is not supported.
-#[derive(Debug, clap::Parser)]
-#[clap(version, author)]
-struct Cli {
-    #[clap(flatten)]
-    verbose: Verbosity<InfoLevel>,
-
+#[derive(Debug, clap::Args)]
+struct CliDumpCommand {
     /// Starting commits given as named references (e.g. HEAD, branchname, etc.)
     #[clap()]
     refs: Vec<String>,
@@ -163,6 +186,22 @@ struct Cli {
     // paths: Vec<String>,
 }
 
+/// Insert dependency information into a co-change database.
+#[derive(Debug, clap::Args)]
+struct AddDeps {
+    /// Path to the database of co-change data.
+    #[clap(long)]
+    db: PathBuf,
+
+    /// The dep file (the output of Depends)
+    #[clap(long)]
+    dep_file: PathBuf,
+
+    /// The hash (SHA-1) of the commit that these dependencies were extracted from
+    #[clap(long)]
+    commit: String,
+}
+
 fn parse_time_input<S: AsRef<str>>(text: S) -> Option<OffsetDateTime> {
     // First, try to parse it as a date and time
     if let Ok(datetime) = OffsetDateTime::parse(text.as_ref(), &Iso8601::PARSING) {
@@ -215,7 +254,11 @@ fn validate_ref_input<'r, S: AsRef<str>>(
     }
 }
 
-fn get_lead_refs(cmd: &mut App, cli: &Cli, repo: &Repository) -> anyhow::Result<Vec<Ref>> {
+fn get_lead_refs(
+    cmd: &mut App,
+    cli: &CliDumpCommand,
+    repo: &Repository,
+) -> anyhow::Result<Vec<Ref>> {
     if cli.all {
         return Ok(repo.references()?.map(|r| gtl::to_ref(&r.unwrap())).try_collect::<Vec<_>>()?);
     }
@@ -229,7 +272,11 @@ fn get_lead_refs(cmd: &mut App, cli: &Cli, repo: &Repository) -> anyhow::Result<
     Ok(lead_refs)
 }
 
-fn get_commit_walk(cmd: &mut App, cli: &Cli, repo: &Repository) -> anyhow::Result<CommitWalk> {
+fn get_commit_walk(
+    cmd: &mut App,
+    cli: &CliDumpCommand,
+    repo: &Repository,
+) -> anyhow::Result<CommitWalk> {
     let mut walk = CommitWalk::new();
     let since = cli.since.as_ref().map(|s| validate_time_input(cmd, s, "--since"));
     let until = cli.until.as_ref().map(|s| validate_time_input(cmd, s, "--until"));
@@ -261,9 +308,17 @@ extern "C" {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut cmd = Cli::command();
     let cli = <Cli as clap::Parser>::parse();
     env_logger::Builder::new().filter_level(cli.verbose.log_level_filter()).init();
+
+    match cli.command {
+        CliSubCommand::Dump(args) => dump(&args),
+        CliSubCommand::AddDeps(args) => add_deps(&args),
+    }
+}
+
+fn dump(cli: &CliDumpCommand) -> anyhow::Result<()> {
+    let mut cmd = Cli::command();
 
     // Check if database already exists
     if !cli.force && Path::new(&cli.db).exists() {
@@ -347,11 +402,38 @@ fn main() -> anyhow::Result<()> {
 
     // Write virtual database to real (on disk) database
     let start = Instant::now();
-    let mut conn = Connection::open(cli.db)?;
+    let mut conn = Connection::open(cli.db.clone())?;
     let tx = conn.transaction()?;
     db.write(&tx)?;
     tx.commit()?;
     log::info!("Wrote virtual database to disk in {}ms", start.elapsed().as_millis());
+
+    Ok(())
+}
+
+fn add_deps(args: &AddDeps) -> anyhow::Result<()> {
+    log::info!("Hello, world!");
+    
+    let start = Instant::now();
+    let deps = load_dep_file(&args.dep_file)?;
+    log::info!("Loaded dep file in {}ms", start.elapsed().as_millis());
+
+    let start = Instant::now();
+    let mut conn = Connection::open(args.db.clone())?;
+    let locs = load_locs(&mut conn, &args.commit)?;
+    log::info!("Loaded entities from database in {}ms", start.elapsed().as_millis());
+
+    let start = Instant::now();
+    let mut vt = DepVirtualTable::new();
+    let commit_id = get_commit_id(&conn, &args.commit)?;
+    insert_deps(&mut vt, &locs, &deps, commit_id)?;
+    log::info!("Wrote to virtual database in {}ms", start.elapsed().as_millis());
+
+    // let start = Instant::now();
+    // let tx = conn.transaction()?;
+    // vt.write::<DepWriter>(&tx)?;
+    // tx.commit()?;
+    // log::info!("Wrote virtual table to disk in {}ms", start.elapsed().as_millis());
 
     Ok(())
 }
