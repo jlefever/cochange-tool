@@ -87,6 +87,7 @@ pub struct EntityKey {
     parent_id: Option<Id>,
     name: String,
     kind: Arc<String>,
+    disc: String,
 }
 
 pub type EntityVirtualTable = VirtualTable<EntityKey, NullExtra>;
@@ -102,22 +103,22 @@ impl<'a> SqlWriter<'a, EntityKey, NullExtra> for EntityWriter<'a> {
             parent_id INT,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
-            -- extra TEXT,
+            disc TEXT NOT NULL,
             
             FOREIGN KEY(parent_id) REFERENCES entities(id),
             CHECK((kind == 'file' AND parent_id IS NULL) OR
                   (kind != 'file' AND parent_id IS NOT NULL)),
-            UNIQUE(parent_id, name, kind)
+            UNIQUE(parent_id, name, kind, disc)
         ) WITHOUT ROWID;"
     }
 
     fn prepare(tx: &'a Transaction) -> Result<Self> {
-        let sql = "INSERT INTO entities (id, parent_id, name, kind) VALUES (?, ?, ?, ?);";
+        let sql = "INSERT INTO entities (id, parent_id, name, kind, disc) VALUES (?, ?, ?, ?, ?);";
         Ok(Self { stmt: tx.prepare_cached(sql)? })
     }
 
     fn execute(&mut self, id: Id, key: &EntityKey, _: &NullExtra) -> Result<usize> {
-        Ok(self.stmt.execute(params![id, key.parent_id, key.name, key.kind])?)
+        Ok(self.stmt.execute(params![id, key.parent_id, key.name, key.kind, key.disc])?)
     }
 }
 
@@ -468,8 +469,8 @@ impl VirtualDb {
 pub fn insert_entity<E: Borrow<Entity>>(db: &mut VirtualDb, entity: E) -> Result<Id> {
     let mut prev_id = None;
 
-    for (name, kind) in entity.borrow().to_vec() {
-        let key = EntityKey::new(prev_id, name, kind);
+    for (name, kind, disc) in entity.borrow().to_vec() {
+        let key = EntityKey::new(prev_id, name, kind, disc);
         prev_id = Some(db.entity_vt.insert(key, NullExtra));
     }
 

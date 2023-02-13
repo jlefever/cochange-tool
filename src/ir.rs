@@ -10,23 +10,24 @@ pub struct Entity {
     pub name: String,
     pub parent: Option<Arc<Entity>>,
     pub kind: Arc<String>,
+    pub disc: String,
 }
 
 impl Entity {
-    pub fn new(parent: Arc<Entity>, name: String, kind: Arc<String>) -> Self {
-        Self { name, parent: Some(parent), kind }
+    pub fn new(parent: Arc<Entity>, name: String, kind: Arc<String>, disc: String) -> Self {
+        Self { name, parent: Some(parent), kind, disc }
     }
 
-    pub fn new_root(name: String, kind: Arc<String>) -> Self {
-        Self { name, parent: None, kind }
+    pub fn new_root(name: String, kind: Arc<String>, disc: String) -> Self {
+        Self { name, parent: None, kind, disc }
     }
 
-    pub fn to_vec(&self) -> Vec<(String, Arc<String>)> {
-        let mut ancestors = vec![(self.name.clone(), self.kind.clone())];
+    pub fn to_vec(&self) -> Vec<(String, Arc<String>, String)> {
+        let mut ancestors = vec![(self.name.clone(), self.kind.clone(), self.disc.clone())];
         let mut current = &self.parent;
 
         while let Some(tag) = current {
-            ancestors.push((tag.name.clone(), tag.kind.clone()));
+            ancestors.push((tag.name.clone(), tag.kind.clone(), tag.disc.clone()));
             current = &tag.parent;
         }
 

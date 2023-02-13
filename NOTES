@@ -38,3 +38,17 @@ Two things to do:
 
 For now, focus on diffs with a single hunk.
 - Deletions and insertions are the easier cases
+
+------
+
+`core/java/android/view/View.java`
+
+------
+
+```
+java -jar ..\depends2023\depends\target\depends-0.9.7-jar-with-dependencies.jar java . deps --detail --output-self-deps --granularity=structure --namepattern=unix --strip-leading-path
+
+cargo run --release -- dump --force --db android-base.db --repo android-base --since 2y android-13.0.0_r24
+
+cargo run --release -- add-deps --db android-base.db --commit 324a1c31a7913611d525a0ffb86382ade5b83b22 --dep-file android-base-deps-structure.json
+```

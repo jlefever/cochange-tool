@@ -275,8 +275,7 @@ pub fn get_presences(
             return git2::TreeWalkResult::Ok;
         }
 
-        let blob = entry.to_object(ctx.repo).unwrap().id();
-        blobs.push((filename, blob));
+        blobs.push((filename, entry.id()));
         git2::TreeWalkResult::Ok
     })?;
 
@@ -350,7 +349,6 @@ pub fn diff_all_files(
                             .expect("failed to create a diffed file")
                     });
 
-                log::trace!("commit: {}; file: {}", commit.id(), filename);
                 diffed_file.hunks.push(hunk.try_into().expect("failed to convert hunk"));
                 true
             }),

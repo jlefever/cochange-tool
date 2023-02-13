@@ -209,7 +209,7 @@ pub fn match_entity_id(locs: &HashMap<String, Vec<Loc>>, ep: &Endpoint) -> Optio
     let locs = locs.unwrap().into_iter();
 
     let locs: Vec<_> = match (ep.line, ep.kind) {
-        (0, EndpointKind::File) => locs.filter(|l| l.level == 0).collect(),
+        (_, EndpointKind::File) => locs.filter(|l| l.level == 0).collect(),
         // Maybe just ignore this dep, if the line number is 0 and its not a file
         (0, _) => {
             return None;
@@ -225,19 +225,19 @@ pub fn match_entity_id(locs: &HashMap<String, Vec<Loc>>, ep: &Endpoint) -> Optio
     }
 
     let ep_name = ep.name();
-    let locs = locs.into_iter().filter(|l| l.name == ep_name).collect::<Vec<_>>();
+    let by_name_locs = locs.iter().filter(|l| l.name == ep_name).collect::<Vec<_>>();
 
-    if locs.len() == 0 {
-        // Don't bother warning if we can't find a var. Its probably a local.
-        // Could we check if the parent is a function to make sure?
-        if !matches!(&ep.kind, EndpointKind::Var) {
-            log::warn!("Could not find a {} named '{}' at {}:{}", &ep.kind, ep_name, &ep.file, &ep.line);
-        }
-        return None;
-    } else if locs.len() == 1 {
-        return Some(locs.get(0).unwrap().entity_id);
+    if by_name_locs.len() == 0 {
+        // There are a couple reasons why an entity can't be found by name:
+        // - It is a parameter name
+        // - It is a function inside an anonymous class inside a function
+        // Maybe we could check for these cases?
+        log::debug!("Could not find a {} named '{}' at {}:{}", &ep.kind, ep_name, &ep.file, &ep.line);
+    } else if by_name_locs.len() == 1 {
+        return Some(by_name_locs.get(0).unwrap().entity_id);
     }
 
+    // If can't find by name, default to the max level
     let max_level = locs.iter().map(|l| l.level).max().unwrap();
     let locs = locs.into_iter().filter(|l| l.level == max_level).collect::<Vec<_>>();
 

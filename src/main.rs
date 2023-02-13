@@ -429,11 +429,11 @@ fn add_deps(args: &AddDeps) -> anyhow::Result<()> {
     insert_deps(&mut vt, &locs, &deps, commit_id)?;
     log::info!("Wrote to virtual database in {}ms", start.elapsed().as_millis());
 
-    // let start = Instant::now();
-    // let tx = conn.transaction()?;
-    // vt.write::<DepWriter>(&tx)?;
-    // tx.commit()?;
-    // log::info!("Wrote virtual table to disk in {}ms", start.elapsed().as_millis());
+    let start = Instant::now();
+    let tx = conn.transaction()?;
+    vt.write::<DepWriter>(&tx)?;
+    tx.commit()?;
+    log::info!("Wrote virtual table to disk in {}ms", start.elapsed().as_millis());
 
     Ok(())
 }

@@ -20,6 +20,7 @@ struct Tag {
     ancestor_ids: Vec<usize>,
     name: String,
     kind: Arc<String>,
+    disc: String,
     range: Range,
 }
 
@@ -27,6 +28,7 @@ pub struct FileParser {
     parser: Parser,
     query: Query,
     name_ix: u32,
+    disc_ix: u32,
     tag_kinds: Vec<Option<Arc<String>>>,
 }
 
@@ -39,13 +41,16 @@ impl FileParser {
         let name_ix =
             query.capture_index_for_name("name").context("failed to find `name` capture")?;
 
+        let disc_ix =
+            query.capture_index_for_name("disc").context("failed to find `disc` capture")?;
+
         let tag_kinds = query
             .capture_names()
             .iter()
             .map(|n| n.strip_prefix("tag.").map(|n| Arc::new(n.to_string())))
             .collect::<Vec<_>>();
 
-        Ok(Self { parser, query, name_ix, tag_kinds })
+        Ok(Self { parser, query, name_ix, disc_ix, tag_kinds })
     }
 
     pub fn parse(&mut self, source: &[u8], filename: &String) -> Result<Vec<LocEntity>> {
@@ -53,7 +58,7 @@ impl FileParser {
         let tree = self.parser.parse(source, None).context("failed to parse source code")?;
         let mut cursor = QueryCursor::new();
 
-        let mut pre_tags = Vec::new();
+        let mut tags = Vec::new();
 
         for r#match in cursor.matches(&self.query, tree.root_node(), source) {
             let mut builder = TagBuilder::default();
@@ -61,6 +66,11 @@ impl FileParser {
             for capture in r#match.captures {
                 if capture.index == self.name_ix {
                     builder.name(capture.node.utf8_text(source).unwrap().to_string());
+                    continue;
+                }
+
+                if capture.index == self.disc_ix {
+                    builder.disc(capture.node.utf8_text(source).unwrap().to_string());
                     continue;
                 }
 
@@ -75,14 +85,18 @@ impl FileParser {
                 log::warn!("Found unused capture: {:?}", capture);
             }
 
-            pre_tags.push(builder.build()?);
+            if builder.disc.is_none() {
+                builder.disc("".to_string());
+            }
+
+            tags.push(builder.build()?);
         }
 
         // Create a "psuedo-entity" for the file to be the root entity
-        let file_tag = Entity::new_root(filename.clone(), Arc::new("file".to_string()));
-        let file_tag = LocEntity::new(Arc::new(file_tag), to_interval(&tree.root_node().range()));
+        let file = Entity::new_root(filename.clone(), Arc::new("file".to_string()), String::new());
+        let file = LocEntity::new(Arc::new(file), to_interval(&tree.root_node().range()));
 
-        Ok(to_loc_entities(file_tag, pre_tags))
+        Ok(to_loc_entities(file, tags))
     }
 }
 
@@ -113,10 +127,10 @@ fn to_loc_entities(file_tag: LocEntity, mut tags: Vec<Tag>) -> Vec<LocEntity> {
 
         let tag = match parent_id {
             Some(parent_id) => match entities.get(parent_id) {
-                Some(parent_tag) => Entity::new(parent_tag.clone(), pre_tag.name, pre_tag.kind),
+                Some(parent_tag) => Entity::new(parent_tag.clone(), pre_tag.name, pre_tag.kind, pre_tag.disc),
                 None => unreachable!(),
             },
-            None => Entity::new(file_tag.entity.clone(), pre_tag.name, pre_tag.kind),
+            None => Entity::new(file_tag.entity.clone(), pre_tag.name, pre_tag.kind, pre_tag.disc),
         };
 
         let tag = Arc::new(tag);
